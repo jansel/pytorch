@@ -130,6 +130,10 @@ commands:
                 git config remote.origin.url https://github.com/pytorch/pytorch.git
                 git config --add remote.origin.fetch +refs/heads/master:refs/remotes/origin/master
                 git fetch --tags --progress https://github.com/pytorch/pytorch.git +refs/heads/master:refs/remotes/origin/master --depth=100 --quiet
+                # PRs generated from ghstack has format CIRCLE_PR_BASE_BRANCH=gh/xxx/1234/base
+                if [[ "${CIRCLE_PR_BASE_BRANCH}" == "gh/"* ]]; then
+                  CIRCLE_PR_BASE_BRANCH=master
+                fi
                 export GIT_MERGE_TARGET=`git log -n 1 --pretty=format:"%H" origin/$CIRCLE_PR_BASE_BRANCH`
                 echo "GIT_MERGE_TARGET: " ${GIT_MERGE_TARGET}
                 export GIT_COMMIT=${CIRCLE_SHA1}
@@ -312,7 +316,6 @@ caffe2_params: &caffe2_params
     DOCKER_IMAGE: << parameters.docker_image >>
     BUILD_ONLY: << parameters.build_only >>
   resource_class: << parameters.resource_class >>
-
 binary_linux_build_params: &binary_linux_build_params
   parameters:
     build_environment:
@@ -379,7 +382,6 @@ binary_windows_params: &binary_windows_params
     BUILD_ENVIRONMENT: << parameters.build_environment >>
     BUILD_FOR_SYSTEM: windows
     JOB_EXECUTOR: <<parameters.executor>>
-
 
 promote_common: &promote_common
   docker:
@@ -1311,7 +1313,6 @@ jobs:
       - persist_to_workspace:
           root: .
           paths: .circleci/scripts
-
   pytorch_python_doc_push:
     environment:
       BUILD_ENVIRONMENT: pytorch-python-doc-push
@@ -1980,7 +1981,6 @@ jobs:
           pip install awscli==1.16.46
 
           "/home/circleci/project/builder/cron/upload_binary_sizes.sh"
-
 
 # There is currently no testing for libtorch TODO
 #  binary_linux_libtorch_3.6m_cpu_test:
@@ -7387,7 +7387,6 @@ workflows:
           filters:
             branches:
               only: postnightly
-
   docker_build:
     triggers:
       - schedule:
@@ -7410,9 +7409,6 @@ workflows:
       - docker_build_job:
           name: "pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7"
           image_name: "pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7"
-      - docker_build_job:
-          name: "pytorch-linux-xenial-cuda9-cudnn7-py3"
-          image_name: "pytorch-linux-xenial-cuda9-cudnn7-py3"
       - docker_build_job:
           name: "pytorch-linux-xenial-cuda9.2-cudnn7-py3-gcc5.4"
           image_name: "pytorch-linux-xenial-cuda9.2-cudnn7-py3-gcc5.4"
@@ -7472,8 +7468,6 @@ workflows:
             project: tensorcomp
             tags_to_keep: "34"
       - docker_hub_index_job
-
-
   # Promotion workflow
   promote:
     jobs:
