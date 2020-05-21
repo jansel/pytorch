@@ -9,8 +9,11 @@ import re
 import torch
 import types
 
+from collections import Counter
 from itertools import chain
 from typing import List
+
+from torch.testing._internal.jit_utils import JitTestCase
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ class PyTorchModuleExtractor(object):
         self.module_names = set()
         self.module_statements = []
         self.imports = dict()
+        self.stats = Counter()
 
     def add_module_alias(self, name: str):
         if "name" in self.output_module.__dict__:
@@ -84,6 +88,15 @@ class PyTorchModuleExtractor(object):
         self.construct_module()
         self.test_modules()
 
+        stats_keys = (
+            "total",
+            "init_ok",
+            "deduced_args_ok",
+            "jit_compiles",
+            "jit_success",
+        )
+        log.info("Stats: %s", [(k, self.stats[k]) for k in stats_keys])
+
     def construct_module(self):
         code = compile(ast.Module(list(chain(self.imports.values(), self.module_statements))),
                        "<string>", "exec")
@@ -121,18 +134,42 @@ class PyTorchModuleExtractor(object):
                 self.test_nn_module(name, value)
 
     def test_nn_module(self, name: str, nn_cls: type):
+        self.stats["total"] += 1
+
         try:
             nn_module = self.instantiate_nn_module(nn_cls)
         except Exception as e:
             log.warning(f"{name} {e.__class__.__name__}: {e}", exc_info=False)
             return
+        self.stats["init_ok"] += 1
 
         try:
             signature = inspect.signature(nn_module.forward)
             num_args = len(list(self.needed_args(signature)))
-            DeduceArgShapes(nn_module, num_args).search()
+            arg_shapes = DeduceArgShapes(nn_module, num_args).search()
+            if not arg_shapes:
+                return
+            args = [torch.rand(shape) for shape in arg_shapes]
         except Exception as e:
-            log.warning(f"{name} {e.__class__.__name__}: {e}", exc_info=True)
+            log.error(f"{name} {e.__class__.__name__}: {e}", exc_info=True)
+            return
+        self.stats["deduced_args_ok"] += 1
+
+        try:
+            torch.jit.script(nn_module)
+        except Exception as e:
+            log.warning(f"JIT COMPILE ERROR: {name}: {e.__class__.__name__}: {e}")
+            return
+        self.stats["jit_compiles"] += 1
+
+        try:
+            JitTestCase().checkScript(nn_module, args)
+        except Exception as e:
+            log.warning(f"JIT INCORRECT: {name}: {e.__class__.__name__}: {e}")
+            return
+
+        self.stats["jit_success"] += 1
+        log.info(f"CORRECT: {name}")
 
     def debug_output(self, filename: str = "output.py"):
         with open(filename, "w") as out:
