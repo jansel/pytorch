@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-import argparse
 import ast
-import astor
 import inspect
+import json
 import logging
 import os
 import re
-import torch
+import time
 import types
-
-from collections import Counter
-from itertools import chain
+import zipfile
+from collections import Counter, defaultdict
 from typing import List
 
+from astor import to_source
+import requests
+
+import torch
 from torch.testing._internal.jit_utils import JitTestCase
 
 log = logging.getLogger(__name__)
@@ -23,19 +25,72 @@ IMPORT_WHITELIST = ("torch",
                     "math", "collections")
 
 
+class Stats(Counter):
+    def __str__(self):
+        stats_keys = (
+            "total",
+            "init_ok",
+            "deduced_args_ok",
+            "jit_compiles",
+            "jit_success",
+        )
+        return str([(k, self[k]) for k in stats_keys])
+
+    def log(self, prefix: str):
+        log.info(f"{prefix}: {str(self)}")
+
+
+class ErrorAggregator(object):
+    def __init__(self):
+        super(ErrorAggregator, self).__init__()
+        self.error_groups = []
+        self.bigram_to_group_ids = defaultdict(list)
+
+    def record(self, e: Exception):
+        error_msg = f"{e.__class__.__name__}: {e}"
+        msg_words = list(re.findall(r"[a-zA-Z]+", error_msg))
+        msg_bigrams = [f"{a}_{b}" for a, b in zip(msg_words, msg_words[1:])] or msg_words
+
+        shared_bigrams = Counter()
+        for bigram in msg_bigrams:
+            shared_bigrams.update(self.bigram_to_group_ids[bigram])
+
+        if shared_bigrams:
+            best_match, count = shared_bigrams.most_common(1)[0]
+            if count > len(msg_bigrams) // 2:
+                self.error_groups[best_match].append(error_msg)
+                return
+
+        # No match, create a new error group
+        group_id = len(self.error_groups)
+        self.error_groups.append([error_msg])
+        for bigram in msg_bigrams:
+            self.bigram_to_group_ids[bigram].append(group_id)
+
+    def __str__(self):
+        errors = sorted(self.error_groups, key=len, reverse=True)
+        return '\n'.join(f" - {len(e)} errors like: {e[0]}"
+                         for e in  errors[:10])
+
+    @classmethod
+    def grouped(cls):
+        return defaultdict(cls)
+
+
 class PyTorchModuleExtractor(object):
     """
     Walk through a filesystem and extract all `torch.nn.Module`,
     then test if they function correctly with the JIT.
     """
 
-    def __init__(self):
+    def __init__(self, errors):
         super().__init__()
         self.output_module = types.ModuleType(f"{__name__}.output")
         self.module_names = set()
         self.module_statements = []
         self.imports = dict()
-        self.stats = Counter()
+        self.stats = Stats()
+        self.errors = errors
 
     def add_module_alias(self, name: str):
         if "name" in self.output_module.__dict__:
@@ -43,7 +98,7 @@ class PyTorchModuleExtractor(object):
         self.output_module.__dict__[name] = self.output_module
         self.module_names.add(name)
 
-    def search_file(self, filename: str):
+    def search_file(self, filename: str, open_fn=open):
         if not filename.endswith(".py") or re.search(r"output\.py$", filename):
             return
 
@@ -51,24 +106,31 @@ class PyTorchModuleExtractor(object):
         if m:
             self.add_module_alias(m.group(1))
 
-        source = open(filename).read()
+        with open_fn(filename, 'r') as fp:
+            source = fp.read()
+            if isinstance(source, bytes):
+                source = source.decode('utf-8')
 
         if not NN_MODULE_RE.search(source):
             return  # fast exit path
 
         self.add_module_alias(os.path.splitext(os.path.basename(filename))[0])
 
-        log.info("Searching %s", filename)
-        tree = ast.parse(source, filename)
+        log.debug("Searching %s", filename)
+        try:
+            tree = ast.parse(source, filename)
+        except Exception as e:
+            return self.errors["parse"].record(e)
+
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.ClassDef):
-                bases = [astor.to_source(x).strip() for x in node.bases]
+                bases = [to_source(x).strip() for x in node.bases]
                 if any(NN_MODULE_RE.match(x) for x in bases):
                     self.module_statements.append(node)
                 elif "torch" in str(bases):
                     log.warning("Maybe need to add a base: %s", bases)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                node_str = astor.to_source(node)
+                node_str = to_source(node)
                 if re.match(r"(from ({0})\b)|(import ({0})\b)".format("|".join(IMPORT_WHITELIST)),
                             node_str):
                     self.imports[node_str] = node
@@ -78,28 +140,38 @@ class PyTorchModuleExtractor(object):
             for name in files:
                 self.search_file(os.path.join(root, name))
 
-    def main(self):
-        parser = argparse.ArgumentParser()
-        parser.add_argument("search_dir")
-        args = parser.parse_args()
-        self.search_directory(args.search_dir)
+    def search_zipfile(self, filename: str):
+        with zipfile.ZipFile(filename) as archive:
+            for name in archive.namelist():
+                self.search_file(name, archive.open)
+
+    def main(self, filename: str):
+        if os.path.isdir(filename):
+            self.search_directory(filename)
+        else:
+            self.search_zipfile(filename)
 
         # self.debug_output()
         self.construct_module()
         self.test_modules()
+        self.stats.log(os.path.basename(filename).replace('.zip', ''))
 
-        stats_keys = (
-            "total",
-            "init_ok",
-            "deduced_args_ok",
-            "jit_compiles",
-            "jit_success",
-        )
-        log.info("Stats: %s", [(k, self.stats[k]) for k in stats_keys])
+        return self.stats
 
     def construct_module(self):
-        code = compile(ast.Module(list(chain(self.imports.values(), self.module_statements))),
-                       "<string>", "exec")
+        for statement in self.imports.values():
+            try:
+                self.add_statement(statement)
+            except Exception as e:
+                self.errors["import"].record(e)
+        for statement in self.module_statements:
+            try:
+                self.add_statement(statement)
+            except Exception as e:
+                self.errors["define"].record(e)
+
+    def add_statement(self, statement):
+        code = compile(ast.Module([statement], []), "<string>", "exec")
         exec(code, self.output_module.__dict__, self.output_module.__dict__)
 
     @staticmethod
@@ -129,8 +201,10 @@ class PyTorchModuleExtractor(object):
         raise NotImplementedError(f"Cant guess value for: {name}")
 
     def test_modules(self):
-        for name, value in self.output_module.__dict__.items():
-            if isinstance(value, type) and issubclass(value, torch.nn.Module):
+        for name, value in list(self.output_module.__dict__.items()):
+            if (isinstance(value, type) and
+                    issubclass(value, torch.nn.Module) and
+                    value.__module__ == self.output_module.__name__):
                 self.test_nn_module(name, value)
 
     def test_nn_module(self, name: str, nn_cls: type):
@@ -139,8 +213,7 @@ class PyTorchModuleExtractor(object):
         try:
             nn_module = self.instantiate_nn_module(nn_cls)
         except Exception as e:
-            log.warning(f"{name} {e.__class__.__name__}: {e}", exc_info=False)
-            return
+            return self.errors['init'].record(e)
         self.stats["init_ok"] += 1
 
         try:
@@ -151,22 +224,19 @@ class PyTorchModuleExtractor(object):
                 return
             args = [torch.rand(shape) for shape in arg_shapes]
         except Exception as e:
-            log.error(f"{name} {e.__class__.__name__}: {e}", exc_info=True)
-            return
+            return self.errors['deduce'].record(e)
         self.stats["deduced_args_ok"] += 1
 
         try:
             torch.jit.script(nn_module)
         except Exception as e:
-            log.warning(f"JIT COMPILE ERROR: {name}: {e.__class__.__name__}: {e}")
-            return
+            return self.errors['compile'].record(e)
         self.stats["jit_compiles"] += 1
 
         try:
             JitTestCase().checkScript(nn_module, args)
         except Exception as e:
-            log.warning(f"JIT INCORRECT: {name}: {e.__class__.__name__}: {e}")
-            return
+            return self.errors['check'].record(e)
 
         self.stats["jit_success"] += 1
         log.info(f"CORRECT: {name}")
@@ -182,7 +252,7 @@ class PyTorchModuleExtractor(object):
             out.write("\n" * 2)
 
             for node in self.module_statements:
-                out.write(astor.to_source(node))
+                out.write(to_source(node))
                 out.write("\n")
 
 
@@ -343,6 +413,72 @@ class DeduceArgShapes(object):
         return [self._default_dim, weight[1] * groups] + [x * self._default_dim for x in weight[2:]]
 
 
+class CrawlGitHub(object):
+    download_dir = "../paritybench_download"
+
+    def github_search(self):
+        base = "https://api.github.com/search/repositories?per_page=100&q="
+        query = "pytorch+language:Python+stars:>1000+size:<10000"
+        total_count = None
+        page = 1
+        while True:
+            time.sleep(6)  # https://developer.github.com/v3/search/#rate-limit
+            rs = requests.get(f"{base}{query}&per_page=100&page={page}")
+            rs.raise_for_status()
+            result = rs.json()
+            assert not result['incomplete_results']
+            yield from result["items"]
+            total_count = total_count or result['total_count']
+            page += 1
+            if len(result["items"]) == 0 or page > (total_count + 99) // 100:
+                return
+
+    def download_project(self, project: dict):
+        name = project["full_name"]
+        url = project["html_url"]
+        default_branch = project["default_branch"]
+        output_filename = re.sub(r"[^a-zA-Z0-9]+", "_", name) + ".zip"
+        output_path = os.path.join(self.download_dir, output_filename)
+        if os.path.exists(output_path):
+            return output_filename
+        time.sleep(10)
+        rs = requests.get(f"{url}/archive/{default_branch}.zip", stream=True)
+        rs.raise_for_status()
+        with open(output_path, "wb") as fd:
+            for chunk in rs.iter_content(chunk_size=8192):
+                fd.write(chunk)
+        return output_filename
+
+    def download(self):
+        metadata_path = os.path.join(self.download_dir, 'metadata.json')
+        if os.path.exists(metadata_path):
+            return
+
+        os.path.exists(self.download_dir) or os.mkdir(self.download_dir)
+        projects = list(self.github_search())
+        metadata = dict()
+        for i, project in enumerate(projects):
+            log.info(f"Downloading {project['full_name']} ({i + 1} of {len(projects)})")
+            metadata[self.download_project(project)] = project
+        with open(metadata_path, "w") as fd:
+            json.dump(metadata, fd)
+
+    def test_all(self):
+        stats = Stats()
+        error_aggregators = defaultdict(ErrorAggregator)
+        for filename in os.listdir(self.download_dir):
+            if filename.endswith('.zip'):
+                stats_part = PyTorchModuleExtractor(error_aggregators).main(os.path.join(self.download_dir, filename))
+                stats.update(stats_part)
+        log.info(f"{len(error_aggregators)}")
+        for name, errors in sorted(error_aggregators.items()):
+            log.info(f"Top 10 errors in {name}:\n{errors}")
+        stats.log('TOTAL')
+
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-    PyTorchModuleExtractor().main()
+    logging.basicConfig(level=logging.INFO)
+    # CrawlGitHub().download()
+    # PyTorchModuleExtractor().main()
+    CrawlGitHub().test_all()
