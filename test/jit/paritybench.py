@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import abc
 import argparse
 import ast
 import inspect
+import itertools
 import json
 import logging
 import multiprocessing
@@ -9,13 +11,15 @@ import os
 import random
 import re
 import resource
+import sys
 import tempfile
 import time
+import traceback
 import types
 import unittest
 import zipfile
 from collections import Counter, defaultdict
-from typing import List
+from typing import List, Callable
 
 import requests
 from astor import to_source
@@ -26,7 +30,7 @@ log = logging.getLogger(__name__)
 
 NN_MODULE_RE = re.compile(r"(\btorch[.]nn\b)|(\bnn[.]Module\b)", re.MULTILINE)
 IMPORT_WHITELIST = {
-    # TODO: "torchvision"/"torchaudio"/etc,  is used by many
+    # TODO: torchvision/torchaudio/etc is used by many
     "torch",
     "math",
     "collections",
@@ -37,7 +41,8 @@ IMPORT_WHITELIST = {
     "typing",
     "types",
     "functools",
-    "itertools"
+    "itertools",
+    "logging",
 }
 
 
@@ -261,10 +266,11 @@ class PyTorchModuleExtractor(object):
 
         signature = inspect.signature(nn_module.forward)
         try:
-            arg_shapes = DeduceArgShapes.search_retry(nn_module, list(self.needed_args(signature)))
-            # TODO: only run once
-            args = [torch.rand(shape) for shape in arg_shapes]
-            python_output = nn_module(*args)
+            deducer = DeduceParameters(nn_module, list(self.needed_args(signature)))
+            deducer.search()
+            args = deducer.last_args
+            kwargs = deducer.last_kwargs
+            python_output = deducer.last_result
         except Exception as e:
             return self.errors['deduce'].record(e)
 
@@ -273,7 +279,7 @@ class PyTorchModuleExtractor(object):
         try:
             # JitTestCase().checkScript(nn_module, args)  doesn't work
             script = torch.jit.script(nn_module)
-            script_output = script(*args)
+            script_output = script(*args, **kwargs)
             self.assertEqual(script_output, python_output)
         except Exception as e:
             return self.errors['compile'].record(e)
@@ -317,7 +323,7 @@ class PyTorchModuleExtractor(object):
             if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
                 continue  # ignore args/kwargs
             if param.default is inspect.Parameter.empty:
-                yield name, param
+                yield param
 
 
 class MockConfig(object):
@@ -340,19 +346,19 @@ class MockConfig(object):
             "gpu": False,
             "groups": 1,
             "block": 1,
-            "_in": DeduceArgShapes.default_size,
-            "_out": DeduceArgShapes.default_size,
-            "in_": DeduceArgShapes.default_size,
-            "out_": DeduceArgShapes.default_size,
-            "dim": DeduceArgShapes.default_size,
-            "planes": DeduceArgShapes.default_size,
-            "filters": DeduceArgShapes.default_size,
-            "size": DeduceArgShapes.default_size,
-            "n_embd": DeduceArgShapes.default_size,
-            "features": DeduceArgShapes.default_size,
-            "word": DeduceArgShapes.default_size,
-            "char": DeduceArgShapes.default_size,
-            "width": DeduceArgShapes.default_size,
+            "_in": DeduceParameters.default_size,
+            "_out": DeduceParameters.default_size,
+            "in_": DeduceParameters.default_size,
+            "out_": DeduceParameters.default_size,
+            "dim": DeduceParameters.default_size,
+            "planes": DeduceParameters.default_size,
+            "filters": DeduceParameters.default_size,
+            "size": DeduceParameters.default_size,
+            "n_embd": DeduceParameters.default_size,
+            "features": DeduceParameters.default_size,
+            "word": DeduceParameters.default_size,
+            "char": DeduceParameters.default_size,
+            "width": DeduceParameters.default_size,
             "config": self,
             "cfg": self,
             "options": self,
@@ -369,180 +375,220 @@ class MockConfig(object):
     __getattr__ = __getitem__
 
 
-class DeduceArgShapes(object):
+class DeductionFailed(RuntimeError):
+    def __init__(self, attempt_log):
+        super().__init__(
+            f"{attempt_log[-1][1]}\n" +
+            "\n".join(f" - {attempt}" for attempt in attempt_log)
+        )
+
+
+class DeduceParameters(object):
     """
     Try to figure out a valid input for an NN module by repeated
     guessing based on error messages.
     """
-    default_size = 8
+    default_size = 4
 
-    def __init__(self, nn_module, initial_guess):
-        super(DeduceArgShapes, self).__init__()
+    def __init__(self, nn_module: Callable, needed_args: List[inspect.Parameter]):
+        super(DeduceParameters, self).__init__()
         self.nn_module = nn_module
-        self.name = nn_module.__class__.__name__
-        self.shape_guess = initial_guess
-        self.shape_tried = [set() for _ in range(len(initial_guess))]
+        self.args = [DeduceParameter(param) for param in needed_args]
+        self.kwargs = dict()
+
         self.attempt_log = []
-        self.give_up = False
-        self.last_error = None
+        self.last_args = None
+        self.last_kwargs = None
+        self.last_result = None
 
     @classmethod
-    def search_retry(cls, nn_module, needed_args):
-        num_args = len(needed_args)
-        deducers = [cls(nn_module, initial_guess)
-                    for initial_guess in (
-                        # cls.initial_guess1(num_args),
-                        cls.initial_guess2(num_args),
-                    )]
-        for deducer in deducers:
-            shape = deducer.search()
-            if shape:
-                return shape
-        raise random.choice(deducers).last_error
-
-    @classmethod
-    def initial_guess1(cls, num_args):
-        return [[cls.default_size] * 3 for _ in range(num_args)]
-
-    @classmethod
-    def initial_guess2(cls, num_args):
-        return [[cls.default_size] + [n + cls.default_size] * (n + 3) for n in range(num_args)]
+    def run(cls, nn_module: Callable, needed_args: List[inspect.Parameter]):
+        return DeduceParameters(nn_module, needed_args).search()
 
     def search_once(self):
-        guess = list(self.shape_guess)
-        args = [torch.rand(shape) for shape in guess]
-        for index, shape in enumerate(guess):
-            self.shape_tried[index].add(repr(shape))
+        self.last_args = [arg.guess() for arg in self.args]
+        self.last_kwargs = {name: arg.guess() for name, arg in self.kwargs.items()}
+        guess_str = ", ".join(itertools.chain(
+            map(str, self.args),
+            [f"{name}={arg}" for name, arg in self.kwargs.items()]))
 
         try:
-            self.nn_module(*args)
-            log.info(f"{self.name}: OK ({guess})")
-            return guess
-        except Exception as e:
-            self.last_error = e
-            msg = str(e)
-            self.attempt_log.append((guess, e.__class__.__name__, msg))
+            self.last_result = self.nn_module(*self.last_args, **self.last_kwargs)
+            return True
+        except Exception:
+            error_type, error_value, tb = sys.exc_info()
+            error_msg = f"{error_type.__name__}: {error_value}"
+            sorted_args = self.sorted_args(tb)
 
-        priority_index_idea = []
-        for index in range(len(guess)):
-            ideas = sorted(self.ideas_from_error(guess[index], msg))
-            if ideas:
-                new_ideas = [(priority, idea) for priority, idea in ideas
-                             if repr(idea) not in self.shape_tried[index]]
-                if new_ideas:
-                    ideas = new_ideas  # drop repeat ideas
-                    priority_offset = 1
-                else:
-                    priority_offset = 0
+        self.attempt_log.append((guess_str, error_msg))
 
-                priority, idea = ideas.pop()
-                priority_index_idea.append((priority + priority_offset, index, idea))
+        for pass_number in (0, 1):
+            for arg in sorted_args:
+                if arg.try_to_fix(error_msg, pass_number):
+                    return False
 
-        if priority_index_idea:
-            max_priority = max(x[0] for x in priority_index_idea)
-            for priority, index, idea in priority_index_idea:
-                if priority == max_priority:
-                    self.shape_guess[index] = idea
-        else:
-            self.give_up = True
+        raise DeductionFailed(self.attempt_log)
+
+    def sorted_args(self, trackback) -> List:
+        """
+        Order args by when they are seen in the traceback so we can fix
+        relevant to the error args first.
+
+        :param trackback: from sys.exc_info()
+        :return: parameters ordered by where they are seen in the traceback
+        """
+        this_file = os.path.basename(__file__)
+        args = list(self.args) + list(self.kwargs.values())
+        for frame in reversed(traceback.extract_tb(trackback, limit=-10)):
+            if this_file in frame.filename:
+                break
+            line = frame.line
+            args.sort(key=lambda x: x.contained_in_line(line), reverse=True)
+        return args
 
     def search(self, limit: int = 10):
         for attempt in range(limit):
-            result = self.search_once()
-            if result:
-                return result
-            if self.give_up:
-                break
+            if self.search_once():
+                return self.last_result
+        raise DeductionFailed(self.attempt_log)
 
-    def ideas_from_error(self, guessed_shape: List[int], error_msg: str) -> List[List[int]]:
-        guesses = []
 
-        match = re.search(
-            r"Given groups=(?P<groups>\d+).*(?P<weight>\[[\d, ]+\]), expected input(?P<got>\[[\d, ]+\])",
-            error_msg)
-        if match:
-            groups = int(match.group("groups"))
-            weight = ast.literal_eval(match.group("weight"))
-            got = ast.literal_eval(match.group("got"))
-            priority = int(got == guessed_shape)
-            guesses.append((priority, self.convolution_guess(weight, groups)))
+class DeduceParameter(object):
+    def __init__(self, parameter: inspect.Parameter):
+        super(DeduceParameter, self).__init__()
+        self.name = parameter.name
+        self._guess = TensorGuess([TensorGuess.default_size] * 2)
 
-        match = re.search(
-            r"Expected \d+-dimensional.*for.*(?P<weight>\[[\d, ]+\]).*got.*(?P<got>\[[\d, ]+\])",
-            error_msg)
-        if match:
-            weight = ast.literal_eval(match.group("weight"))
-            got = ast.literal_eval(match.group("got"))
-            priority = int(got == guessed_shape)
-            guesses.append((priority, self.convolution_guess(weight)))
+    def guess(self):
+        return self._guess.guess()
 
-        match = re.search(r"(\d+) channels, but got (\d+) channels", error_msg)
-        if match:
-            want = int(match.group(1))
-            got = int(match.group(2))
-            guess = list(guessed_shape)
+    def try_to_fix(self, error_message: str, pass_number: int) -> bool:
+        new_guess = self._guess.get_fix(error_message, pass_number)
+        if new_guess is not None:
+            self._guess = new_guess
+            return True
+        return False
+
+    def contained_in_line(self, line: str):
+        pattern = r"\b{}\b".format(re.escape(self.name))
+        return bool(re.search(pattern, line))
+
+    def __str__(self):
+        return str(self._guess)
+
+
+class Guess(object):
+    @staticmethod
+    def apply_fixors(fixors, error_msg):
+        for pattern, fixor in fixors:
+            match = re.search(pattern, error_msg, flags=re.I)
+            if match:
+                fix = fixor(**{k: ast.literal_eval(v) for k, v in match.groupdict().items()})
+                if fix is not None:
+                    return fix
+
+    @abc.abstractmethod
+    def guess(self):
+        raise NotImplementedError()
+
+    @abc.abstractmethod
+    def get_fix(self, error_message: str, pass_number: int):
+        raise NotImplementedError()
+
+
+class LiteralGuess(Guess):
+    def __init__(self, value):
+        super(LiteralGuess, self).__init__()
+        self.value = value
+
+    def guess(self):
+        return self.value
+
+    def get_fix(self, error_message: str, pass_number: int):
+        pass
+
+    def __str__(self):
+        return str(self.value)
+
+
+class TensorGuess(Guess):
+    default_size = DeduceParameters.default_size
+
+    def __init__(self, shape, dtype=torch.float32):
+        super(TensorGuess, self).__init__()
+        self.shape = shape
+        self.dtype = dtype
+
+    def __str__(self):
+        return f"tensor({self.shape})"
+
+    def guess(self):
+        return torch.randn(self.shape, dtype=self.dtype)
+
+    def get_fix(self, error_message: str, pass_number: int):
+        new_shape = self.apply_fixors(self.shape_fixors(pass_number), error_message)
+        if new_shape is not None:
+            return TensorGuess(new_shape, self.dtype)
+
+    def shape_fixors(self, pass_number: int):
+        if pass_number == 0:
+            return [
+                (r"Given groups=(?P<groups>\d+).*(?P<weight>\[[\d, ]+\]), expected input(?P<got>\[[\d, ]+\])",
+                 self.fix_convolution_if_matching),
+                (r"Expected \d+-dimensional.*for.*(?P<weight>\[[\d, ]+\]).*got.*(?P<got>\[[\d, ]+\])",
+                 self.fix_convolution_if_matching),
+                (r"(?P<want>\d+) channels, but got (?P<got>\d+) channels",
+                 self.fix_num_channels),
+                (r"same number of dimensions: got (?P<want>\d+) and (?P<got>\d+)",
+                 self.fix_dimensions),
+                (r"Got (?P<got>\d+)D .*needs (?P<want>\d+)D",
+                 self.fix_dimensions),
+                (r"The size.*[(](?P<want>\d+)[)] must match.*[(](?P<got>\d+)[)] at.*dimension (?P<dim>\d+)",
+                 self.fix_dimensions_at),
+                (r"must match except in dimension \d+. Got (?P<want>\d+) and (?P<got>\d+) in dimension (?P<dim>\d+)",
+                 self.fix_dimensions_at),
+            ]
+        if pass_number == 1:
+            return [
+                (r"Given groups=(?P<groups>\d+).*(?P<weight>\[[\d, ]+\]), expected input\[[\d, ]+\]",
+                 self.fix_convolution),
+                (r"Expected \d+-dimensional.*for.*(?P<weight>\[[\d, ]+\]).*got.*\[[\d, ]+\]",
+                 self.fix_convolution),
+                (r"same number of dimensions: got (?P<got>\d+) and (?P<want>\d+)",
+                 self.fix_dimensions),
+                (r"Got \d+D .*needs (?P<want>\d+)D",
+                 self.fix_dimensions),
+                (r"The size.*[(](?P<got>\d+)[)] must match.*[(](?P<want>\d+)[)] at.*dimension (?P<dim>\d+)",
+                 self.fix_dimensions_at),
+                (r"must match except in dimension \d+. Got (?P<got>\d+) and (?P<want>\d+) in dimension (?P<dim>\d+)",
+                 self.fix_dimensions_at),
+            ]
+
+    def fix_convolution(self, weight: List[int], groups: int = 1):
+        return [self.default_size, weight[1] * groups] + [x * self.default_size for x in weight[2:]]
+
+    def fix_convolution_if_matching(self, weight, got, groups=1):
+        if got == self.shape:
+            return self.fix_convolution(weight, groups)
+
+    def fix_num_channels(self, want, got):
+        guess = list(self.shape)
+        if len(guess) > 1:
             guess[1] = guess[1] * want // got
             if guess[1] > 0:
-                guesses.append((-10, guess))
+                return guess
 
-        match = re.search(r"same number of dimensions: got (\d+) and (\d+)",
-                          error_msg)
-        if match:
-            a = int(match.group(1))
-            b = int(match.group(2))
-            if len(guessed_shape) in (a, b):
-                if len(guessed_shape) == b:
-                    priority = 10
-                    want_len = a
-                else:
-                    priority = 0
-                    want_len = b
-                guesses.extend([
-                    (priority, list(other))
-                    for other in self.shape_guess
-                    if len(other) == want_len])
+    def fix_dimensions(self, want, got=None):
+        shape = list(self.shape)
+        if got is None or len(shape) == got:
+            shape.extend([self.default_size] * want)
+            return shape[:want]
 
-        match = re.search(r"Got (\d+)D .*needs (\d+)D", error_msg)
-        if match:
-            got = int(match.group(1))
-            need = int(match.group(2))
-            if len(guessed_shape) == got:
-                guess = [self.default_size] * need
-                guesses.append((0, guess))
-
-        match = re.search(
-            r"The size.*[(](\d+)[)] must match.*[(](\d+)[)] at.*dimension (\d+)",
-            error_msg) or re.search(
-            r"must match except in dimension \d+. Got (\d+) and (\d+) in dimension (\d+)",
-            error_msg)
-        if match:
-            a = int(match.group(1))
-            b = int(match.group(2))
-            dim = int(match.group(3))
-            if dim < len(guessed_shape):
-                if guessed_shape[dim] == a:
-                    priority = -20  # prefer changing B
-                    a, b = b, a
-                elif guessed_shape[dim] == b:
-                    priority = 10
-                else:
-                    priority = -50
-
-                others = ([x for x in self.shape_guess if len(x) > dim and x[dim] == a] or
-                          [x for x in self.shape_guess if x != guessed_shape])
-                if others:
-                    guesses.extend((priority, list(other)) for other in others)
-
-                if guessed_shape[dim] != a:
-                    guess = list(guessed_shape)
-                    guess[dim] = a
-                    priority = int(guessed_shape[dim] == b)
-                    guesses.append((priority, guess))
-
-        return guesses
-
-    def convolution_guess(self, weight: List[int], groups: int = 1):
-        return [self.default_size, weight[1] * groups] + [x * self.default_size for x in weight[2:]]
+    def fix_dimensions_at(self, want, got, dim):
+        shape = list(self.shape)
+        if dim < len(shape) and shape[dim] == got:
+            shape[dim] = want
+            return shape
 
 
 class ASTCleanup(ast.NodeTransformer):
@@ -843,15 +889,14 @@ def test_zipfile_subproc(tempdir: str, path: str, return_pipe: multiprocessing.P
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('--download', action='store_true')
-    group.add_argument('--run')
-    parser.add_argument('--directory')
-    parser.add_argument('--limit', type=int)
+    group.add_argument("--download", action="store_true")
+    group.add_argument("--run")
+    parser.add_argument("--download-dir", "-d", default="../paritybench_download")
+    parser.add_argument("--limit", "-l", type=int)
     args = parser.parse_args()
 
     if args.download:
-        download_dir = args.directory or "../paritybench_download_100star"
-        CrawlGitHub(download_dir).download()
+        CrawlGitHub(args.download_dir).download()
         return
 
     if args.run:
@@ -861,9 +906,7 @@ def main():
         log.info(f"Stats: {stats}")
         return
 
-    # Run them all
-    download_dir = args.directory or "../paritybench_download_1000star"
-    test_all(download_dir, args.limit)
+    test_all(args.download_dir, args.limit)
 
 
 if __name__ == "__main__":
