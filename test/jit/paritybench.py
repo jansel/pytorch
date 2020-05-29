@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+from collections import Counter, defaultdict
+from functools import reduce
+from typing import List, Callable
 import abc
 import argparse
 import ast
@@ -8,7 +11,6 @@ import json
 import logging
 import multiprocessing
 import os
-import random
 import re
 import resource
 import sys
@@ -18,8 +20,6 @@ import traceback
 import types
 import unittest
 import zipfile
-from collections import Counter, defaultdict
-from typing import List, Callable
 
 import requests
 from astor import to_source
@@ -241,12 +241,6 @@ class PyTorchModuleExtractor(object):
             code = compile(open(filename).read(), filename, "exec")
         exec(code, self.output_module.__dict__, self.output_module.__dict__)
 
-    def instantiate_nn_module(self, nn_cls: type):
-        config = MockConfig()
-        signature = inspect.signature(nn_cls)
-        kwargs = {name: config[name] for name, param in self.needed_args(signature)}
-        return nn_cls(**kwargs)
-
     def test_modules(self):
         for name, value in list(self.output_module.__dict__.items()):
             if (isinstance(value, type) and
@@ -257,20 +251,27 @@ class PyTorchModuleExtractor(object):
     def test_nn_module(self, name: str, nn_cls: type):
         self.stats["total"] += 1
 
+        init_signature = inspect.signature(nn_cls)
         try:
-            nn_module = self.instantiate_nn_module(nn_cls)
+            init_deducer = DeduceParameters(
+                nn_cls,
+                *DeduceParameters.initial_args_init(init_signature))
+            init_deducer.search()
+            nn_module = init_deducer.last_result
         except Exception as e:
             return self.errors['init'].record(e)
 
         self.stats["init_ok"] += 1
 
-        signature = inspect.signature(nn_module.forward)
+        forward_signature = inspect.signature(nn_module.forward)
         try:
-            deducer = DeduceParameters(nn_module, list(self.needed_args(signature)))
-            deducer.search()
-            args = deducer.last_args
-            kwargs = deducer.last_kwargs
-            python_output = deducer.last_result
+            forward_deducer = DeduceParameters(
+                nn_module,
+                *DeduceParameters.initial_args_forward(forward_signature))
+            forward_deducer.search()
+            args = forward_deducer.last_args
+            kwargs = forward_deducer.last_kwargs
+            python_output = forward_deducer.last_result
         except Exception as e:
             return self.errors['deduce'].record(e)
 
@@ -317,68 +318,11 @@ class PyTorchModuleExtractor(object):
                 out.write(to_source(node))
                 out.write("\n")
 
-    @staticmethod
-    def needed_args(signature: inspect.Signature):
-        for name, param in signature.parameters.items():
-            if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
-                continue  # ignore args/kwargs
-            if param.default is inspect.Parameter.empty:
-                yield param
-
-
-class MockConfig(object):
-    """
-    Try to get an unknown nn.Module's init to run by guessing values
-    """
-
-    def __getitem__(self, name):
-        common_args = {
-            "num_modules": 1,
-            "stride": 1,
-            "channel": 3,
-            "n_tag": 2,
-            "num_classes": 2,
-            "scale": 1.0,
-            "class": 2,
-            "layer": 1,
-            "padding": 0,
-            "dilation": 1,
-            "gpu": False,
-            "groups": 1,
-            "block": 1,
-            "_in": DeduceParameters.default_size,
-            "_out": DeduceParameters.default_size,
-            "in_": DeduceParameters.default_size,
-            "out_": DeduceParameters.default_size,
-            "dim": DeduceParameters.default_size,
-            "planes": DeduceParameters.default_size,
-            "filters": DeduceParameters.default_size,
-            "size": DeduceParameters.default_size,
-            "n_embd": DeduceParameters.default_size,
-            "features": DeduceParameters.default_size,
-            "word": DeduceParameters.default_size,
-            "char": DeduceParameters.default_size,
-            "width": DeduceParameters.default_size,
-            "config": self,
-            "cfg": self,
-            "options": self,
-            "depth": 1,
-            "hidden": 1,
-            "loss": torch.nn.MSELoss(),
-            "dropout": 0.5,
-        }
-        for search_name, placeholder_value in common_args.items():
-            if search_name in name:
-                return placeholder_value
-        raise NotImplementedError(f"{name}")
-
-    __getattr__ = __getitem__
-
 
 class DeductionFailed(RuntimeError):
-    def __init__(self, attempt_log):
+    def __init__(self, attempt_log, name=''):
         super().__init__(
-            f"{attempt_log[-1][1]}\n" +
+            f"{attempt_log[-1][1]}\n{name}:\n" +
             "\n".join(f" - {attempt}" for attempt in attempt_log)
         )
 
@@ -390,16 +334,40 @@ class DeduceParameters(object):
     """
     default_size = 4
 
-    def __init__(self, nn_module: Callable, needed_args: List[inspect.Parameter]):
+    @staticmethod
+    def needed_args(signature: inspect.Signature):
+        for name, param in signature.parameters.items():
+            if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
+                continue  # ignore args/kwargs
+            if param.default is inspect.Parameter.empty:
+                yield param
+
+    @classmethod
+    def initial_args_init(cls, signature: inspect.Signature = None):
+        return [], {param.name: DeduceParameter.initial_arg_init(param, position)
+                    for position, param in enumerate(cls.needed_args(signature))}
+
+    @classmethod
+    def initial_args_forward(cls, signature: inspect.Signature):
+        return [DeduceParameter.initial_arg_forward(param, position)
+                for position, param in enumerate(cls.needed_args(signature))], {}
+
+    def __init__(self, nn_module: Callable, args: list, kwargs: dict):
         super(DeduceParameters, self).__init__()
         self.nn_module = nn_module
-        self.args = [DeduceParameter(param) for param in needed_args]
-        self.kwargs = dict()
+        self.args = args
+        self.kwargs = kwargs
+        self.tried = set()
 
         self.attempt_log = []
         self.last_args = None
         self.last_kwargs = None
         self.last_result = None
+
+    def __str__(self):
+        return ", ".join(itertools.chain(
+            map(str, self.args),
+            [f"{name}={arg}" for name, arg in self.kwargs.items()]))
 
     @classmethod
     def run(cls, nn_module: Callable, needed_args: List[inspect.Parameter]):
@@ -408,9 +376,8 @@ class DeduceParameters(object):
     def search_once(self):
         self.last_args = [arg.guess() for arg in self.args]
         self.last_kwargs = {name: arg.guess() for name, arg in self.kwargs.items()}
-        guess_str = ", ".join(itertools.chain(
-            map(str, self.args),
-            [f"{name}={arg}" for name, arg in self.kwargs.items()]))
+        guess_str = str(self)
+        self.tried.add(guess_str)
 
         try:
             self.last_result = self.nn_module(*self.last_args, **self.last_kwargs)
@@ -422,12 +389,21 @@ class DeduceParameters(object):
 
         self.attempt_log.append((guess_str, error_msg))
 
+        if Guess.apply_fixors(self.get_fixors(), error_msg):
+            if str(self) not in self.tried:
+                return False
+
         for pass_number in (0, 1):
             for arg in sorted_args:
                 if arg.try_to_fix(error_msg, pass_number):
-                    return False
+                    if str(self) not in self.tried:
+                        return False
+                    arg.rollback()
 
-        raise DeductionFailed(self.attempt_log)
+        raise DeductionFailed(self.attempt_log, str(type(self.nn_module)))
+
+    def all_args(self):
+        return list(self.args) + list(self.kwargs.values())
 
     def sorted_args(self, trackback) -> List:
         """
@@ -438,7 +414,7 @@ class DeduceParameters(object):
         :return: parameters ordered by where they are seen in the traceback
         """
         this_file = os.path.basename(__file__)
-        args = list(self.args) + list(self.kwargs.values())
+        args = self.all_args()
         for frame in reversed(traceback.extract_tb(trackback, limit=-10)):
             if this_file in frame.filename:
                 break
@@ -450,65 +426,234 @@ class DeduceParameters(object):
         for attempt in range(limit):
             if self.search_once():
                 return self.last_result
-        raise DeductionFailed(self.attempt_log)
+        raise DeductionFailed(self.attempt_log, str(type(self.nn_module)))
+
+    def get_fixors(self):
+        return [
+            (r"missing.*argument: (?P<name>['][a-zA-Z0-9_]+['])",
+             self.fix_missing_arg),
+            (r"unexpected keyword argument (?P<name>['][a-zA-Z0-9_]+['])",
+             self.fix_extra_arg),
+            (r"size mismatch, m1: (?P<a>\[.*\]), m2: (?P<b>\[.*\])",
+             self.fix_size_mismatch),
+
+        ]
+
+    def fix_size_mismatch(self, a, b):
+        matches_a = [arg for arg in self.all_args() if arg.is_shape_match(a)]
+        matches_b = [arg for arg in self.all_args() if arg.is_shape_match(b)]
+        if not matches_a and not matches_b:
+            matches_a = [arg for arg in self.all_args() if arg.is_element_count_match(a)]
+            matches_b = [arg for arg in self.all_args() if arg.is_element_count_match(b)]
+
+        if matches_a and matches_b:
+            if max(x.created for x in matches_a) > max(x.created for x in matches_b):
+                # prefer changing the old one
+                matches_a, matches_b = matches_b, matches_a
+            guess_a = min(matches_a, key=lambda x: x.created)
+            guess_b = max(matches_b, key=lambda x: x.created)
+            guess_a.change_guess(guess_b._guesses[-1].clone())
+            return True
+
+        if matches_b:
+            matches_a, matches_b = matches_b, matches_a
+            a, b = b, a
+
+        if matches_a:
+            guess = min(matches_a, key=lambda x: x.created)
+            guess.change_guess(TensorGuess(shape=b))
+            return True
+
+    def fix_missing_arg(self, name):
+        if any(arg.name == name for arg in self.args):
+            return
+        if name in self.kwargs:
+            # try moving it to args?
+            self.args.append(self.kwargs.pop(name))
+            self.args.sort(key=lambda x: x.position)
+        else:
+            self.kwargs[name] = DeduceParameter.initial_arg_init(name, float('inf'))
+        return True
+
+    def fix_extra_arg(self, name):
+        if name in self.kwargs:
+            del self.kwargs[name]
+            return True
 
 
 class DeduceParameter(object):
-    def __init__(self, parameter: inspect.Parameter):
+    @classmethod
+    def initial_arg_init(cls, name, position):
+        name = getattr(name, 'name', name)
+        if 'dataset' in name:
+            # TODO: this likely wont work...
+            return cls.initial_arg_forward(name, position)
+
+        common_args = {
+            "stride": 1,
+            "scale": 1.0,
+            "layer": 1,
+            "padding": 0,
+            "dilation": 1,
+            "groups": 1,
+            "block": 1,
+            "depth": 1,
+            "hidden": 1,
+            "gpu": False,
+            "loss": torch.nn.MSELoss(),
+            "dropout": 0.5,
+        }
+        for search_name, placeholder_value in common_args.items():
+            if search_name in name:
+                return cls(name, position, LiteralGuess(placeholder_value))
+
+        for search_name in ('cfg', 'config', 'options'):
+            if search_name in name:
+                return cls(name, position, ConfigGuess())
+
+        return cls(name, position, LiteralGuess(DeduceParameters.default_size))
+
+    @property
+    def created(self):
+        return self._guesses[-1].created
+
+    @classmethod
+    def initial_arg_forward(cls, name, position=None):
+        name = getattr(name, 'name', name)
+        return cls(name, position, TensorGuess([TensorGuess.default_size] * 4))
+
+    def __init__(self, name: str, position, initial_guess):
         super(DeduceParameter, self).__init__()
-        self.name = parameter.name
-        self._guess = TensorGuess([TensorGuess.default_size] * 2)
+        self.name = name
+        self.position = position
+        self._guesses = [initial_guess]
 
     def guess(self):
-        return self._guess.guess()
+        return self._guesses[-1].guess()
 
     def try_to_fix(self, error_message: str, pass_number: int) -> bool:
-        new_guess = self._guess.get_fix(error_message, pass_number)
+        new_guess = self._guesses[-1].get_fix(error_message, pass_number)
         if new_guess is not None:
-            self._guess = new_guess
+            self.change_guess(new_guess)
             return True
         return False
+
+    def change_guess(self, guess):
+        self._guesses.append(guess)
 
     def contained_in_line(self, line: str):
         pattern = r"\b{}\b".format(re.escape(self.name))
         return bool(re.search(pattern, line))
 
+    def rollback(self):
+        self._guesses.pop()
+
     def __str__(self):
-        return str(self._guess)
+        return str(self._guesses[-1])
+
+    def is_shape_match(self, shape):
+        if isinstance(self._guesses[-1], TensorGuess):
+            return self._guesses[-1].shape == shape
+
+    def is_element_count_match(self, shape):
+        if isinstance(self._guesses[-1], TensorGuess):
+            count = reduce(lambda a, b: a * b, shape)
+            this_count = reduce(lambda a, b: a * b, self._guesses[-1].shape)
+            return count == this_count
 
 
 class Guess(object):
+    def __init__(self, value=None):
+        super(Guess, self).__init__()
+        self.value = value
+        self.created = time.time()
+
     @staticmethod
     def apply_fixors(fixors, error_msg):
         for pattern, fixor in fixors:
             match = re.search(pattern, error_msg, flags=re.I)
             if match:
-                fix = fixor(**{k: ast.literal_eval(v) for k, v in match.groupdict().items()})
+                fix = fixor(**{k: Guess.literal(v) for k, v in match.groupdict().items()})
                 if fix is not None:
+                    log.debug(f"FIX: {fixor.__name__} {error_msg}")
                     return fix
 
-    @abc.abstractmethod
-    def guess(self):
-        raise NotImplementedError()
-
-    @abc.abstractmethod
-    def get_fix(self, error_message: str, pass_number: int):
-        raise NotImplementedError()
-
-
-class LiteralGuess(Guess):
-    def __init__(self, value):
-        super(LiteralGuess, self).__init__()
-        self.value = value
+    @staticmethod
+    def literal(value):
+        return ast.literal_eval(value.replace(" x ", ","))
 
     def guess(self):
         return self.value
 
+    @abc.abstractmethod
     def get_fix(self, error_message: str, pass_number: int):
-        pass
+        raise NotImplementedError()
 
     def __str__(self):
         return str(self.value)
+
+    def get_fix(self, error_message: str, pass_number: int):
+        if pass_number > 0:
+            return
+
+        def fix_unpack_int():
+            if isinstance(self.value, int):
+                return [TensorGuess.default_size] * 2
+
+        def fix_too_many(want):
+            try:
+                if len(self.value) > want:
+                    return [TensorGuess.default_size] * want
+            except TypeError:
+                pass
+
+        def fix_too_few(want, got):
+            try:
+                if len(self.value) == got:
+                    return [TensorGuess.default_size] * want
+            except TypeError:
+                pass
+
+        fixors = [
+            (r"TypeError: cannot unpack non-iterable int object", fix_unpack_int),
+            (r"ValueError: too many values to unpack \(expected (?P<want>\d+)\)", fix_too_many),
+            (r"ValueError: not enough values to unpack \(expected (?P<want>\d+), got (?P<got>\d+)\)", fix_too_few),
+        ]
+
+        new_value = self.apply_fixors(fixors, error_message)
+        if new_value is not None:
+            return LiteralGuess(new_value)
+
+
+class LiteralGuess(Guess):
+    def get_fix(self, error_message: str, pass_number: int):
+        fix = super(LiteralGuess, self).get_fix(error_message, pass_number)
+        if fix:
+            return fix
+
+        if pass_number > 0:
+            return
+
+        fixors = [
+            ("TypeError: (?P<typename>'[^']+') object is not subscriptable",
+             self.fix_not_subscriptable),
+        ]
+
+        new_value = self.apply_fixors(fixors, error_message)
+        if new_value is not None:
+            return LiteralGuess(new_value)
+
+    def fix_not_subscriptable(self, typename):
+        if typename == 'int' and isinstance(self.value, int):
+            return [TensorGuess.default_size] * 2
+
+
+class ConfigGuess(Guess):
+    def __init__(self):
+        super(ConfigGuess, self).__init__(value=MockConfig())
+
+    def get_fix(self, error_message: str, pass_number: int):
+        pass
 
 
 class TensorGuess(Guess):
@@ -516,19 +661,26 @@ class TensorGuess(Guess):
 
     def __init__(self, shape, dtype=torch.float32):
         super(TensorGuess, self).__init__()
+        assert isinstance(shape, list)
+        assert all(isinstance(x, int) for x in shape)
         self.shape = shape
         self.dtype = dtype
+        self.value = torch.randn(self.shape, dtype=self.dtype)
+
+    def clone(self):
+        return self.__class__(self.shape, self.dtype)
 
     def __str__(self):
-        return f"tensor({self.shape})"
-
-    def guess(self):
-        return torch.randn(self.shape, dtype=self.dtype)
+        return f"shape({self.shape})"
 
     def get_fix(self, error_message: str, pass_number: int):
+        fix = super(TensorGuess, self).get_fix(error_message, pass_number)
+        if fix:
+            return fix
+
         new_shape = self.apply_fixors(self.shape_fixors(pass_number), error_message)
         if new_shape is not None:
-            return TensorGuess(new_shape, self.dtype)
+            return self.__class__(new_shape, self.dtype)
 
     def shape_fixors(self, pass_number: int):
         if pass_number == 0:
@@ -543,10 +695,18 @@ class TensorGuess(Guess):
                  self.fix_dimensions),
                 (r"Got (?P<got>\d+)D .*needs (?P<want>\d+)D",
                  self.fix_dimensions),
+                (r"input must have (?P<want>\d+) dimensions, got (?P<got>\d+)",
+                 self.fix_dimensions),
                 (r"The size.*[(](?P<want>\d+)[)] must match.*[(](?P<got>\d+)[)] at.*dimension (?P<dim>\d+)",
                  self.fix_dimensions_at),
                 (r"must match except in dimension \d+. Got (?P<want>\d+) and (?P<got>\d+) in dimension (?P<dim>\d+)",
                  self.fix_dimensions_at),
+                (r"matrices expected, got (?P<got>\d+)D, (?P<want>\d+)D ",
+                 self.fix_dimensions),
+                (r"expected \d+D or (?P<want>\d+)D input \(got (?P<got>\d+)D input\)",
+                 self.fix_dimensions),
+                (r"Expected.*size (?P<want>[\d, ()]+), got (?P<got>[\d, ()]+)",
+                 self.fix_shape),
             ]
         if pass_number == 1:
             return [
@@ -562,7 +722,13 @@ class TensorGuess(Guess):
                  self.fix_dimensions_at),
                 (r"must match except in dimension \d+. Got (?P<got>\d+) and (?P<want>\d+) in dimension (?P<dim>\d+)",
                  self.fix_dimensions_at),
+                (r"expected (?P<want>\d+)D or \d+D input \(got (?P<got>\d+)D input\)",
+                 self.fix_dimensions),
             ]
+
+    def fix_shape(self, want, got):
+        if self.shape == list(got):
+            return list(want)
 
     def fix_convolution(self, weight: List[int], groups: int = 1):
         return [self.default_size, weight[1] * groups] + [x * self.default_size for x in weight[2:]]
@@ -589,6 +755,20 @@ class TensorGuess(Guess):
         if dim < len(shape) and shape[dim] == got:
             shape[dim] = want
             return shape
+
+
+class MockConfig(object):
+    def __init__(self):
+        super(MockConfig, self).__init__()
+        self._guesses = dict()
+        self._values = dict()
+
+    def __getitem__(self, item):
+        if item not in self._guesses:
+            self._guesses[item] = DeduceParameter.initial_arg_init(name=item, position=None)
+        return self._values[item].guess()
+
+    __getattr__ = __getitem__
 
 
 class ASTCleanup(ast.NodeTransformer):
