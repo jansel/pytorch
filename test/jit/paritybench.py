@@ -32,7 +32,7 @@ import torch
 
 log = logging.getLogger(__name__)
 
-RUN_SCRIPT = False
+RUN_SCRIPT = False  # some scripts hang when run, so this causes many timeouts
 NN_MODULE_RE = re.compile(r"(\btorch[.]nn\b)|(\bnn[.]Module\b)", re.MULTILINE)
 IMPORT_WHITELIST = {
     # TODO: torchvision/torchaudio/etc is used by many
@@ -44,24 +44,30 @@ IMPORT_WHITELIST = {
     "logging",
     "math",
     "numpy",
+    "warnings",
     "random"
     "random",
     "scipy",
     "torch",
     "types",
     "typing",
+    "string"
     "uuid",
+    "re",
 }
 PREFIX = '''
-from unittest.mock import mock_open
+from unittest.mock import mock_open, MagicMock
 open = mock_open()
-__version__ = "1.0.0"
+args = config = cfg = argparse = MagicMock()
+__version__ = "0.0.0"
+from torch.autograd import Function
+from torch.nn import Module
 '''
 
 
 class Stats(Counter):
     """
-    Counter used to report totals by module
+    Collect and group error messages for a debug report at the end
     """
 
     def __str__(self):
@@ -104,7 +110,10 @@ class ErrorAggregator(object):
 
     def _add(self, error_msg: str, errors: List):
         msg_words = list(re.findall(r"[a-zA-Z]+", error_msg))
-        msg_bigrams = [f"{a}_{b}" for a, b in zip(msg_words, msg_words[1:])] or msg_words
+        if "NameError" in error_msg:
+            msg_bigrams = [error_msg]  # need exact match
+        else:
+            msg_bigrams = [f"{a}_{b}" for a, b in zip(msg_words, msg_words[1:])] or msg_words
 
         shared_bigrams = Counter()
         for bigram in msg_bigrams:
@@ -138,6 +147,10 @@ class ErrorAggregator(object):
 
 
 class ErrorAggregatorDict(object):
+    """
+    Collect and group error messages for a debug report at the end
+    """
+
     @classmethod
     def single(cls, name: str, e: Exception, context=None):
         errors = cls(context)
@@ -217,7 +230,8 @@ class PyTorchModuleExtractor(object):
 
         self.search_ast(tree, has_match)
 
-    def ast_parse(self, source, filename):
+    @staticmethod
+    def ast_parse(source, filename):
         try:
             return ast.parse(source, filename)
         except SyntaxError:
@@ -242,7 +256,7 @@ class PyTorchModuleExtractor(object):
                 if overwrite:
                     for module_name, import_node in self.split_import(node):
                         if module_name == "torch":
-                            # Run torch imports
+                            # Run torch imports so we can run issubclass(.., torch.nn.Module)
                             try:
                                 exec(compile(ast.Module([import_node], []), "<string>", "exec"),
                                      scope.__dict__,
@@ -267,6 +281,16 @@ class PyTorchModuleExtractor(object):
         except Exception:
             log.exception("Error in is_torch_nn_module()")
 
+    def search_directory(self, filename: str):
+        for root, _, files in os.walk(filename, topdown=False):
+            for name in files:
+                self.search_file(os.path.join(root, name))
+
+    def search_zipfile(self, filename: str):
+        with zipfile.ZipFile(filename) as archive:
+            for name in archive.namelist():
+                self.search_file(name, archive.open)
+
     @staticmethod
     def split_import(node):
         if isinstance(node, ast.Import):
@@ -287,23 +311,13 @@ class PyTorchModuleExtractor(object):
                 ast.copy_location(tmp, node)
                 yield module_name, tmp
 
-    def search_directory(self, filename: str):
-        for root, _, files in os.walk(filename, topdown=False):
-            for name in files:
-                self.search_file(os.path.join(root, name))
-
-    def search_zipfile(self, filename: str):
-        with zipfile.ZipFile(filename) as archive:
-            for name in archive.namelist():
-                self.search_file(name, archive.open)
-
     def add_available_symbol(self, node, overwrite=False):
         try:
             if overwrite:
                 self.available_symbols[node.name] = node
             else:
                 self.available_symbols.setdefault(node.name, node)
-        except AttributeError:
+        except AttributeError:  # node.name is missing
             reads, writes = ExtractReadsWrites.run(node)
             for name in writes:
                 if overwrite:
@@ -312,18 +326,18 @@ class PyTorchModuleExtractor(object):
                     self.available_symbols.setdefault(name, node)
 
     def add_module_alias(self, name: str, overwrite: bool):
-        if "name" in self.output_module.__dict__ and not overwrite:
+        """
+        We flatten everything we extract into a single module, this adds
+        a symbol to that unified module that points to the same module
+        so that internal a.b.c references work.
+
+        :param name: alternate name for self.output_module
+        :param overwrite: if true, replace an existing symbol
+        """
+        if name in self.output_module.__dict__ and not overwrite:
             return
         self.output_module.__dict__[name] = self.output_module
         self.output_py.write(f"{name} = _module\n")
-
-    @staticmethod
-    def is_literal(node):
-        try:
-            ast.literal_eval(node)
-            return True
-        except ValueError:
-            return False
 
     def construct_module(self):
         self.run_statement(self.ast_parse(PREFIX, "<string>"), source_required=True)
@@ -340,16 +354,22 @@ class PyTorchModuleExtractor(object):
                 self.errors.record("constant", e, getattr(statement, "name", ""))
         for statement in self.module_statements:
             try:
-                # fixed = ast.fix_missing_locations(ASTCleanup().visit(statement))
                 self.add_requirements(statement)
+                statement = ast.fix_missing_locations(ASTCleanup().visit(statement))
                 self.run_statement(statement, source_required=True)
             except Exception as e:
                 self.errors.record("define", e, getattr(statement, "name", ""))
 
     def add_requirements(self, statement):
+        """
+        Recursively add symbols to the output module needed by statement.
+
+        :param statement: ast.Node to add to the module
+        """
         reads, writes = ExtractReadsWrites.run(statement)
         for name in reads - writes:
-            if not hasattr(self.output_module, name) and name in self.available_symbols:
+            if (name in self.available_symbols and
+                    getattr(self.output_module, name, self.output_module) is self.output_module):
                 requirement = self.available_symbols.pop(name)
                 self.add_requirements(requirement)
                 self.run_statement(requirement, source_required=True)
@@ -429,7 +449,7 @@ class PyTorchModuleExtractor(object):
         self.stats["jit_correct"] += 1
 
     def assertEqual(self, a, b):
-        # TODO(jansel): find/resuse an existing version of this
+        # TODO(jansel): find/reuse an existing version of this
         tc = unittest.TestCase()
         if isinstance(a, torch.Tensor):
             tc.assertTrue(torch.allclose(a, b))
@@ -462,23 +482,11 @@ class PyTorchModuleExtractor(object):
         log.info(f"{basename}: {self.stats}")
 
 
-def call_might_hang(fn, args, kwargs):
-    parent_conn, child_conn = multiprocessing.Pipe()
-    proc = multiprocessing.Process(target=fn, args=args, kwargs=kwargs)
-    proc.start()
-
-
-def call(fn, args, kwargs):
-    return fn(*args, **kwargs)
-
-
 class DeductionFailed(RuntimeError):
     def __init__(self, attempt_log, name='', traceback=''):
-        super().__init__(
-            f"{attempt_log[-1][1]}\n{name}:\n" +
-            "\n".join(f" - {attempt}" for attempt in attempt_log) +
-            f"\n----\n{traceback}\n----\n"
-        )
+        attempt_lines = "\n".join(f" - {attempt}" for attempt in attempt_log)
+        error_msg = f"{attempt_log[-1][1]}\n{name}:\n{attempt_lines}\n----\n{traceback}\n----\n"
+        super().__init__(error_msg)
 
 
 class DeduceParameters(object):
@@ -549,7 +557,7 @@ class DeduceParameters(object):
             if str(self) not in self.tried:
                 return False
 
-        for pass_number in (0, 1):
+        for pass_number in (0, 1, 2):
             for arg in sorted_args:
                 if arg.try_to_fix(error_msg, pass_number):
                     if str(self) not in self.tried:
@@ -622,7 +630,7 @@ class DeduceParameters(object):
                 matches_a, matches_b = matches_b, matches_a
             guess_a = min(matches_a, key=lambda x: x.created)
             guess_b = max(matches_b, key=lambda x: x.created)
-            guess_a.change_guess(guess_b._guesses[-1].clone())
+            guess_a.change_guess(guess_b.clone_guess())
             return True
 
         if matches_b:
@@ -652,6 +660,10 @@ class DeduceParameters(object):
 
 
 class DeduceParameter(object):
+    """
+    Contains and tracks the guesses of the value of a single parameter.
+    """
+
     @classmethod
     def initial_arg_init(cls, name, position):
         name = getattr(name, 'name', name)
@@ -663,12 +675,12 @@ class DeduceParameter(object):
             "stride": 1,
             "scale": 1.0,
             "layer": 1,
-            "padding": 0,
             "dilation": 1,
             "groups": 1,
             "block": 1,
             "depth": 1,
             "gpu": False,
+            "train": False,
             "loss": torch.nn.MSELoss(),
             "dropout": 0.5,
             "drop_rate": 0.5,
@@ -700,6 +712,9 @@ class DeduceParameter(object):
 
     def guess(self):
         return self._guesses[-1].guess()
+
+    def clone_guess(self):
+        return self._guesses[-1].clone()
 
     def num_guesses(self):
         return len(self._guesses)
@@ -742,6 +757,10 @@ class DeduceParameter(object):
 
 
 class Guess(object):
+    """
+    Base class of a single guess of the value of parameter.
+    """
+
     def __init__(self, value=None):
         super(Guess, self).__init__()
         self.value = value
@@ -775,7 +794,7 @@ class Guess(object):
         pass
 
 
-def layer(in_features=None, out_features=None, bias=True):
+def _layer(in_features=None, out_features=None, bias=True):
     if in_features and out_features:
         return torch.nn.Linear(in_features, out_features, bias)
     return torch.nn.ReLU()
@@ -793,6 +812,10 @@ class LiteralGuess(Guess):
         fixors = []
 
         if isinstance(self.value, int):
+            def fix_too_small():
+                if self.value < 64:
+                    return 64
+
             fixors.extend([
                 (r"TypeError: cannot unpack non-iterable int object",
                  lambda: [TensorGuess.default_size] * 2),
@@ -807,41 +830,41 @@ class LiteralGuess(Guess):
                 (r"TypeError: int is not a Module subclass",
                  lambda: torch.nn.ReLU()),
                 (r"DeductionFailed: TypeError: 'int' object is not callable",
-                 lambda: layer),
+                 lambda: _layer),
                 (r"ModuleList.extend should be called with an iterable, but got int",
                  lambda: [torch.nn.ReLU()]),
+                (r"ModuleDict.update should be called.*but got int",
+                 lambda: {'relu': torch.nn.ReLU()}),
                 (r"AttributeError: 'int' object has no attribute 'split'",
                  lambda: "2,2"),
                 (r"IndexError: index 0 is out of bounds for dimension 0 with size 0",
-                 lambda: 64 if self.value < 64 else None),
+                 fix_too_small),
                 (r"ValueError: .* must be divisible by groups",
-                 lambda: 64 if self.value < 64 else None),
+                 fix_too_small),
                 (r"KeyError: [1-9]",
-                 lambda: self.value // 2)
+                 lambda: self.value // 2),
+                (r"multiple of (?P<m>\d{1,3})",
+                 lambda m: m),
             ])
 
         if isinstance(self.value, list):
             def fix_too_many(want):
-                try:
-                    if len(self.value) > want:
-                        return [TensorGuess.default_size] * want
-                except TypeError:
-                    pass
+                if len(self.value) > want:
+                    return [TensorGuess.default_size] * want
 
             def fix_too_few(want, got):
-                try:
-                    if len(self.value) == got:
-                        return [TensorGuess.default_size] * want
-                except TypeError:
-                    pass
+                if len(self.value) == got:
+                    return [TensorGuess.default_size] * want
 
             fixors.extend([
-                (r"ValueError: too many values to unpack \(expected (?P<want>\d+)\)", fix_too_many),
-                (r"ValueError: not enough values to unpack \(expected (?P<want>\d+), got (?P<got>\d+)\)", fix_too_few),
+                (r"ValueError: too many values to unpack \(expected (?P<want>\d+)\)",
+                 fix_too_many),
+                (r"ValueError: not enough values to unpack \(expected (?P<want>\d+), got (?P<got>\d+)\)",
+                 fix_too_few),
                 (r"not supported between instances of '(list|int)' and '(list|int)'",
                  lambda: TensorGuess.default_size),
                 (r"TypeError: 'list' object is not callable",
-                 lambda: layer),
+                 lambda: _layer),
                 (r"IndexError: list index out of range",
                  lambda: self.value + [TensorGuess.default_size]),
             ])
@@ -870,15 +893,15 @@ class TensorGuess(Guess):
             # used for embedding lookups often
             self.value = torch.zeros(self.shape, dtype=self.dtype)
         else:
-            self.value = torch.randn(self.shape, dtype=self.dtype)
+            self.value = torch.rand(self.shape, dtype=self.dtype)
 
     def clone(self):
         return self.__class__(self.shape, self.dtype)
 
     def __str__(self):
         if self.dtype == torch.float32:
-            return f"rand({self.shape})"
-        return f"rand({self.shape}, {self.dtype})"
+            return f"torch.rand({self.shape})"
+        return f"torch.rand({self.shape}, dtype={self.dtype})"
 
     def get_fix(self, error_message: str, pass_number: int, name: str):
         fix = super(TensorGuess, self).get_fix(error_message, pass_number, name)
@@ -900,11 +923,14 @@ class TensorGuess(Guess):
              lambda: self.__class__([self.default_size], torch.int64)),
             (r"Expected dtype int64 for index",
              lambda: self.__class__([self.default_size], torch.int64)),
-            (r"TypeError: [']Tensor['] object is not callable", tried_to_call),
+            (r"TypeError: [']Tensor['] object is not callable",
+             tried_to_call),
             (r"TypeError: only integer tensors of a single element can be converted to an index",
              lambda: LiteralGuess(0)),
             (r"'lengths' argument should be a 1D CPU int64 tensor",
              lambda: (self.__class__([self.default_size], torch.int64) if "len" in name else None)),
+            (r"Boolean value of Tensor with more than one value is ambiguous",
+             lambda: LiteralGuess(0)),
         ]
         return self.apply_fixors(other_fixors, error_message)
 
@@ -949,6 +975,8 @@ class TensorGuess(Guess):
                  self.fix_dimension_out_of_range),
                 (r"sizes provided \((?P<want>\d+)\) must be greater or equal.* \((?P<got>\d+)\)",
                  self.fix_dimensions),
+                (r"size mismatch, m1: (?P<a>\[.*\]), m2: (?P<b>\[.*\])",
+                 self.fix_size_mismatch),
             ]
         if pass_number == 1:
             return [
@@ -969,6 +997,16 @@ class TensorGuess(Guess):
                 (r"Expected tensor to have size (?P<got>\d+) at dimension (?P<dim>\d+), but got size (?P<want>\d+)",
                  self.fix_dimensions_at),
             ]
+        if pass_number == 2:
+            return [
+                (r"Expected \d+-dimensional.*for.*(?P<weight>\[[\d, ]+\]).*got.*(?P<got>\[[\d, ]+\])",
+                 self.fix_convolution_offset),
+            ]
+
+    def fix_size_mismatch(self, a, b):
+        # b may be hidden part of a nn.Linear()
+        if self.shape[-1] == a[-1]:
+            return self.shape[:-1] + [b[0]]
 
     def fix_dimension_out_of_range(self, got, want):
         if 0 <= got < want:
@@ -985,8 +1023,16 @@ class TensorGuess(Guess):
         if got == self.shape:
             return self.fix_convolution(weight, groups)
 
+    def fix_convolution_offset(self, weight: List[int], got: List[int]):
+        if len(got) == len(self.shape) - 1:
+            return [self.default_size, self.default_size, weight[1]] + [64 for _ in weight[2:]]
+
     def fix_num_channels(self, want, got):
         guess = list(self.shape)
+        for idx in (1, 2, 3):
+            if len(guess) > idx and guess[idx] == got:
+                guess[idx] = want
+                return guess
         if len(guess) > 1:
             guess[1] = guess[1] * want // got
             if guess[1] > 0:
@@ -1051,7 +1097,7 @@ class MockConfig(object):
 
 class ASTCleanup(ast.NodeTransformer):
     def visit_Import(self, node):
-        return None  # Remove the node
+        return ast.Constant(value=None, kind=None)
 
     visit_ImportFrom = visit_Import
 
@@ -1059,7 +1105,7 @@ class ASTCleanup(ast.NodeTransformer):
         if getattr(node.func, 'id', '') == 'print':
             # Strip print() calls
             return ast.Constant(value=None, kind=None)
-        return None
+        return self.generic_visit(node)
 
 
 class ExtractReadsWrites(ast.NodeVisitor):
@@ -1181,15 +1227,14 @@ class CrawlGitHub(object):
 
 def test_all(download_dir, limit=None):
     start = time.time()
-    limit = limit or float('inf')
     stats = Stats()
     errors = ErrorAggregatorDict()
     zipfiles = [os.path.join(download_dir, f)
                 for f in os.listdir(download_dir)
                 if f.endswith(".zip")]
+
     if limit:
         zipfiles = zipfiles[:limit]
-
     pool = ThreadPool(8)
     for errors_part, stats_part in pool.imap_unordered(test_zipfile, zipfiles):
         errors.update(errors_part)
