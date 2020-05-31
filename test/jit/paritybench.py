@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-from collections import Counter, defaultdict
-from functools import reduce
-from typing import List, Callable
-import abc
 import argparse
 import ast
 import inspect
@@ -11,8 +7,11 @@ import json
 import logging
 import multiprocessing
 import os
+import random
 import re
 import resource
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -20,6 +19,11 @@ import traceback
 import types
 import unittest
 import zipfile
+from collections import Counter, defaultdict
+from functools import reduce
+from multiprocessing.pool import ThreadPool
+from typing import List, Callable, TextIO
+from unittest.mock import patch
 
 import requests
 from astor import to_source
@@ -28,22 +32,144 @@ import torch
 
 log = logging.getLogger(__name__)
 
+RUN_SCRIPT = False
 NN_MODULE_RE = re.compile(r"(\btorch[.]nn\b)|(\bnn[.]Module\b)", re.MULTILINE)
 IMPORT_WHITELIST = {
     # TODO: torchvision/torchaudio/etc is used by many
-    "torch",
-    "math",
-    "collections",
-    "numpy",
-    "scipy",
-    "inspect",
     "abc",
-    "typing",
-    "types",
+    "collections",
     "functools",
+    "inspect",
     "itertools",
     "logging",
+    "math",
+    "numpy",
+    "random"
+    "random",
+    "scipy",
+    "torch",
+    "types",
+    "typing",
+    "uuid",
 }
+PREFIX = '''
+from unittest.mock import mock_open
+open = mock_open()
+__version__ = "1.0.0"
+'''
+
+
+class Stats(Counter):
+    """
+    Counter used to report totals by module
+    """
+
+    def __str__(self):
+        """
+        Reorder key print order by stage in the process
+        """
+        stats_keys = [
+            "total",
+            "init_ok",
+            "deduced_args_ok",
+            "jit_compiles",
+        ]
+        stats_keys = stats_keys + list(set(self.keys()) - set(stats_keys))
+        return str([(k, self[k]) for k in stats_keys])
+
+
+class ErrorAggregator(object):
+    """
+    Collect and group error messages for report at the end
+    """
+
+    def __init__(self, context=None, log=None):
+        super(ErrorAggregator, self).__init__()
+        if context:
+            self.context = re.sub(r"\.zip$", ".py", context)
+        else:
+            self.context = ""
+        self.error_groups = []
+        self.bigram_to_group_ids = defaultdict(list)
+        self.log = log or logging.getLogger(__name__)
+
+    def record(self, e: Exception, module):
+        ex_msg = str(e).strip().split('\n')[0]
+        error_msg = f"{e.__class__.__name__}: {ex_msg}"
+        return self._add(error_msg, [(error_msg, f"{self.context}:{module}")])
+
+    def update(self, other):
+        for errors in other.error_groups:
+            self._add(errors[0][0], errors)
+
+    def _add(self, error_msg: str, errors: List):
+        msg_words = list(re.findall(r"[a-zA-Z]+", error_msg))
+        msg_bigrams = [f"{a}_{b}" for a, b in zip(msg_words, msg_words[1:])] or msg_words
+
+        shared_bigrams = Counter()
+        for bigram in msg_bigrams:
+            shared_bigrams.update(self.bigram_to_group_ids[bigram])
+
+        if shared_bigrams:
+            best_match, count = shared_bigrams.most_common(1)[0]
+            if count > len(msg_bigrams) // 2:
+                self.error_groups[best_match].extend(errors)
+                return False
+
+        # No match, create a new error group
+        group_id = len(self.error_groups)
+        self.error_groups.append(errors)
+        for bigram in msg_bigrams:
+            self.bigram_to_group_ids[bigram].append(group_id)
+
+        return True
+
+    @staticmethod
+    def format_error_group(errors):
+        context, context_count = random.choice(list(Counter(context for msg, context in errors).items()))
+        return f"  - {len(errors)} errors like: {errors[0][0]} (example {context})"
+
+    def __str__(self):
+        errors = sorted(self.error_groups, key=len, reverse=True)
+        return '\n'.join(map(self.format_error_group, errors[:20]))
+
+    def __len__(self):
+        return sum(map(len, self.error_groups))
+
+
+class ErrorAggregatorDict(object):
+    @classmethod
+    def single(cls, name: str, e: Exception, context=None):
+        errors = cls(context)
+        errors.record(name, e, 'global')
+        return errors
+
+    def __init__(self, context=None):
+        super(ErrorAggregatorDict, self).__init__()
+        self.aggregator = dict()
+        self.context = context
+        if context:
+            self.name = re.sub(r"[.]zip$", "", os.path.basename(context))
+        else:
+            self.name = __name__
+
+    def __getitem__(self, item):
+        if item not in self.aggregator:
+            self.aggregator[item] = ErrorAggregator(self.context, logging.getLogger(f"{item}.{self.name}"))
+        return self.aggregator[item]
+
+    def update(self, other):
+        for key, value in other.aggregator.items():
+            self[key].update(other=value)
+
+    def print_report(self):
+        for name in sorted(list(self.aggregator.keys())):
+            self[name].log.info(f"\nTop errors in {name} ({len(self[name])} total):\n{self[name]}\n")
+
+    def record(self, error_type, error, module=None):
+        module = str(getattr(module, "__name__", module))
+        if self[error_type].record(error, module):
+            log.exception(f"{error_type} error from {self.context}:{module}")
 
 
 class PyTorchModuleExtractor(object):
@@ -52,14 +178,14 @@ class PyTorchModuleExtractor(object):
     then test if they function correctly with the JIT.
     """
 
-    def __init__(self, tempdir: str, errors, stats):
+    def __init__(self, tempdir: str, errors: ErrorAggregatorDict, stats: Stats, output_py: TextIO):
         super(PyTorchModuleExtractor, self).__init__()
         self.tempdir = tempdir
         self.errors = errors
         self.stats = stats
 
         self.output_module = types.ModuleType(f"{__name__}.output")
-        self.module_names = set()
+        self.output_py = output_py
 
         self.imports = dict()
         self.constants = []
@@ -71,26 +197,37 @@ class PyTorchModuleExtractor(object):
         if not filename.endswith(".py") or re.search(r"output\.py$", filename):
             return
 
-        m = re.match(r"([a-z0-9_]+)/__init__.py$", filename, re.I)
-        if m:
-            self.add_module_alias(m.group(1))
-
         with open_fn(filename, 'r') as fp:
             source = fp.read()
             if isinstance(source, bytes):
                 source = source.decode('utf-8')
 
-        overwrite = bool(NN_MODULE_RE.search(source))
+        has_match = bool(NN_MODULE_RE.search(source))
 
-        log.debug("Searching %s", filename)
         try:
-            tree = ast.parse(source, filename)
+            tree = self.ast_parse(source, filename)
         except Exception as e:
-            return self.errors["parse"].record(e)
+            return self.errors.record("parse", e)
 
-        self.add_module_alias(os.path.splitext(os.path.basename(filename))[0], overwrite)
+        m = re.search(r"([a-z0-9_]+)/__init__.py$", filename, re.I)
+        if m:
+            self.add_module_alias(m.group(1), has_match)
+        else:
+            self.add_module_alias(os.path.splitext(os.path.basename(filename))[0], has_match)
 
-        self.search_ast(tree, overwrite)
+        self.search_ast(tree, has_match)
+
+    def ast_parse(self, source, filename):
+        try:
+            return ast.parse(source, filename)
+        except SyntaxError:
+            # perhaps python2?
+            with tempfile.NamedTemporaryFile(mode="wb", suffix=".py") as tmp:
+                tmp.write(re.sub(r"\basync *=", "non_blocking=", source).encode('utf-8'))
+                tmp.flush()
+                with open("/dev/null", "w") as null:
+                    subprocess.check_call(["2to3", "-w", tmp.name], stderr=null, stdout=null)
+                return ast.parse(open(tmp.name).read(), filename)
 
     def search_ast(self, tree: ast.AST, overwrite: bool):
         scope = types.ModuleType("_scope")
@@ -178,7 +315,7 @@ class PyTorchModuleExtractor(object):
         if "name" in self.output_module.__dict__ and not overwrite:
             return
         self.output_module.__dict__[name] = self.output_module
-        self.module_names.add(name)
+        self.output_py.write(f"{name} = _module\n")
 
     @staticmethod
     def is_literal(node):
@@ -188,37 +325,26 @@ class PyTorchModuleExtractor(object):
         except ValueError:
             return False
 
-    def main(self, filename: str):
-        if os.path.isdir(filename):
-            self.search_directory(filename)
-        else:
-            self.search_zipfile(filename)
-
-        # self.debug_output()
-        self.construct_module()
-        self.test_modules()
-        basename = re.sub(r"[.]zip$", "", os.path.basename(filename))
-        log.info(f"{basename}: {self.stats}")
-        return self.stats
-
     def construct_module(self):
+        self.run_statement(self.ast_parse(PREFIX, "<string>"), source_required=True)
+
         for statement in self.imports.values():
             try:
                 self.run_statement(statement)
             except Exception as e:
-                self.errors["import"].record(e)
+                self.errors.record("import", e, "")
         for statement in self.constants:
             try:
                 self.run_statement(statement)
             except Exception as e:
-                self.errors["constant"].record(e)
+                self.errors.record("constant", e, getattr(statement, "name", ""))
         for statement in self.module_statements:
             try:
                 # fixed = ast.fix_missing_locations(ASTCleanup().visit(statement))
                 self.add_requirements(statement)
                 self.run_statement(statement, source_required=True)
             except Exception as e:
-                self.errors["define"].record(e)
+                self.errors.record("define", e, getattr(statement, "name", ""))
 
     def add_requirements(self, statement):
         reads, writes = ExtractReadsWrites.run(statement)
@@ -229,6 +355,7 @@ class PyTorchModuleExtractor(object):
                 self.run_statement(requirement, source_required=True)
 
     def run_statement(self, statement, source_required=False):
+        source = to_source(statement)
         if not source_required:
             code = compile(ast.Module([statement], []), "<string>", "exec")
         else:
@@ -236,10 +363,11 @@ class PyTorchModuleExtractor(object):
             assert self.tempdir
             fn, filename = tempfile.mkstemp(suffix='.py', dir=self.tempdir, )
             with os.fdopen(fn, "w") as fd:
-                fd.write(to_source(statement))
+                fd.write(source)
                 fd.flush()
-            code = compile(open(filename).read(), filename, "exec")
+            code = compile(source, filename, "exec")
         exec(code, self.output_module.__dict__, self.output_module.__dict__)
+        self.output_py.writelines(["\n", source, "\n"])
 
     def test_modules(self):
         for name, value in list(self.output_module.__dict__.items()):
@@ -259,7 +387,7 @@ class PyTorchModuleExtractor(object):
             init_deducer.search()
             nn_module = init_deducer.last_result
         except Exception as e:
-            return self.errors['init'].record(e)
+            return self.errors.record('init', e, nn_cls)
 
         self.stats["init_ok"] += 1
 
@@ -273,20 +401,32 @@ class PyTorchModuleExtractor(object):
             kwargs = forward_deducer.last_kwargs
             python_output = forward_deducer.last_result
         except Exception as e:
-            return self.errors['deduce'].record(e)
+            return self.errors.record('deduce', e, nn_cls)
 
         self.stats["deduced_args_ok"] += 1
 
         try:
-            # JitTestCase().checkScript(nn_module, args)  doesn't work
             script = torch.jit.script(nn_module)
+        except Exception as e:
+            return self.errors.record('compile', e, nn_cls)
+
+        self.stats["jit_compiles"] += 1
+
+        if not RUN_SCRIPT:
+            return
+
+        try:
             script_output = script(*args, **kwargs)
+        except Exception as e:
+            return self.errors.record('run', e, nn_cls)
+
+        try:
+            # JitTestCase().checkScript(nn_module, args)  doesn't work
             self.assertEqual(script_output, python_output)
         except Exception as e:
-            return self.errors['compile'].record(e)
+            return self.errors.record('output', e, nn_cls)
 
-        self.stats["jit_success"] += 1
-        log.info(f"CORRECT: {name}")
+        self.stats["jit_correct"] += 1
 
     def assertEqual(self, a, b):
         # TODO(jansel): find/resuse an existing version of this
@@ -304,26 +444,40 @@ class PyTorchModuleExtractor(object):
         else:
             tc.assertEqual(a, b)
 
-    def debug_output(self, filename: str = "output.py"):
-        with open(filename, "w") as out:
-            out.writelines(["import sys\n",
-                            "_module = sys.modules[__name__]\n"])
-            out.writelines([f"{module_name} = _module\n" for module_name in self.module_names])
+    def main(self, filename: str):
+        self.output_py.writelines([
+            "import sys\n",
+            "_module = sys.modules[__name__]\n",
+            "del sys\n"])
 
-            for import_line in self.imports.keys():
-                out.write(import_line)
-            out.write("\n" * 2)
+        if os.path.isdir(filename):
+            self.search_directory(filename)
+        else:
+            self.search_zipfile(filename)
 
-            for node in self.module_statements:
-                out.write(to_source(node))
-                out.write("\n")
+        # self.debug_output()
+        self.construct_module()
+        self.test_modules()
+        basename = re.sub(r"[.]zip$", "", os.path.basename(filename))
+        log.info(f"{basename}: {self.stats}")
+
+
+def call_might_hang(fn, args, kwargs):
+    parent_conn, child_conn = multiprocessing.Pipe()
+    proc = multiprocessing.Process(target=fn, args=args, kwargs=kwargs)
+    proc.start()
+
+
+def call(fn, args, kwargs):
+    return fn(*args, **kwargs)
 
 
 class DeductionFailed(RuntimeError):
-    def __init__(self, attempt_log, name=''):
+    def __init__(self, attempt_log, name='', traceback=''):
         super().__init__(
             f"{attempt_log[-1][1]}\n{name}:\n" +
-            "\n".join(f" - {attempt}" for attempt in attempt_log)
+            "\n".join(f" - {attempt}" for attempt in attempt_log) +
+            f"\n----\n{traceback}\n----\n"
         )
 
 
@@ -363,6 +517,7 @@ class DeduceParameters(object):
         self.last_args = None
         self.last_kwargs = None
         self.last_result = None
+        self.last_traceback = None
 
     def __str__(self):
         return ", ".join(itertools.chain(
@@ -386,6 +541,7 @@ class DeduceParameters(object):
             error_type, error_value, tb = sys.exc_info()
             error_msg = f"{error_type.__name__}: {error_value}"
             sorted_args = self.sorted_args(tb)
+            self.last_traceback = traceback.format_exc(-2)
 
         self.attempt_log.append((guess_str, error_msg))
 
@@ -400,7 +556,7 @@ class DeduceParameters(object):
                         return False
                     arg.rollback()
 
-        raise DeductionFailed(self.attempt_log, str(type(self.nn_module)))
+        raise DeductionFailed(self.attempt_log, str(type(self.nn_module)), self.last_traceback)
 
     def all_args(self):
         return list(self.args) + list(self.kwargs.values())
@@ -415,6 +571,7 @@ class DeduceParameters(object):
         """
         this_file = os.path.basename(__file__)
         args = self.all_args()
+        # args.sort(lambda x: x.num_guesses())
         for frame in reversed(traceback.extract_tb(trackback, limit=-10)):
             if this_file in frame.filename:
                 break
@@ -423,20 +580,33 @@ class DeduceParameters(object):
         return args
 
     def search(self, limit: int = 10):
-        for attempt in range(limit):
-            if self.search_once():
-                return self.last_result
-        raise DeductionFailed(self.attempt_log, str(type(self.nn_module)))
+        try:
+            for attempt in range(limit):
+                if self.search_once():
+                    return self.last_result
+        except DeductionFailed:
+            pass  # ignore error as we will try again
+
+        for arg in self.all_args():
+            arg.alt_guess()
+
+        if str(self) not in self.tried:
+            for attempt in range(limit):
+                if self.search_once():
+                    return self.last_result
+
+        raise DeductionFailed(self.attempt_log, str(type(self.nn_module)), self.last_traceback)
 
     def get_fixors(self):
         return [
-            (r"missing.*argument: (?P<name>['][a-zA-Z0-9_]+['])",
+            (r"missing.*arguments?: (?P<name>['][a-zA-Z0-9_]+['])",
              self.fix_missing_arg),
             (r"unexpected keyword argument (?P<name>['][a-zA-Z0-9_]+['])",
              self.fix_extra_arg),
             (r"size mismatch, m1: (?P<a>\[.*\]), m2: (?P<b>\[.*\])",
              self.fix_size_mismatch),
-
+            (r"shape (?P<a>\[[\d, ]+\]) doesn't match the broadcast shape (?P<b>\[[\d, ]+\])]",
+             self.fix_size_mismatch),
         ]
 
     def fix_size_mismatch(self, a, b):
@@ -498,29 +668,25 @@ class DeduceParameter(object):
             "groups": 1,
             "block": 1,
             "depth": 1,
-            "hidden": 1,
             "gpu": False,
             "loss": torch.nn.MSELoss(),
             "dropout": 0.5,
+            "drop_rate": 0.5,
         }
         for search_name, placeholder_value in common_args.items():
             if search_name in name:
                 return cls(name, position, LiteralGuess(placeholder_value))
 
-        for search_name in ('cfg', 'config', 'options'):
+        for search_name in ('cfg', 'config', 'options', 'args'):
             if search_name in name:
                 return cls(name, position, ConfigGuess())
 
         return cls(name, position, LiteralGuess(DeduceParameters.default_size))
 
-    @property
-    def created(self):
-        return self._guesses[-1].created
-
     @classmethod
-    def initial_arg_forward(cls, name, position=None):
+    def initial_arg_forward(cls, name, position=None, dims=4):
         name = getattr(name, 'name', name)
-        return cls(name, position, TensorGuess([TensorGuess.default_size] * 4))
+        return cls(name, position, TensorGuess([TensorGuess.default_size] * dims))
 
     def __init__(self, name: str, position, initial_guess):
         super(DeduceParameter, self).__init__()
@@ -528,11 +694,18 @@ class DeduceParameter(object):
         self.position = position
         self._guesses = [initial_guess]
 
+    @property
+    def created(self):
+        return self._guesses[-1].created
+
     def guess(self):
         return self._guesses[-1].guess()
 
+    def num_guesses(self):
+        return len(self._guesses)
+
     def try_to_fix(self, error_message: str, pass_number: int) -> bool:
-        new_guess = self._guesses[-1].get_fix(error_message, pass_number)
+        new_guess = self._guesses[-1].get_fix(error_message, pass_number, self.name)
         if new_guess is not None:
             self.change_guess(new_guess)
             return True
@@ -546,6 +719,7 @@ class DeduceParameter(object):
         return bool(re.search(pattern, line))
 
     def rollback(self):
+        self._guesses[-1].rollback()
         self._guesses.pop()
 
     def __str__(self):
@@ -560,6 +734,11 @@ class DeduceParameter(object):
             count = reduce(lambda a, b: a * b, shape)
             this_count = reduce(lambda a, b: a * b, self._guesses[-1].shape)
             return count == this_count
+
+    def alt_guess(self):
+        if isinstance(self._guesses[-1], TensorGuess):
+            # try starting with a smaller size
+            self.change_guess(TensorGuess([TensorGuess.default_size] * 2))
 
 
 class Guess(object):
@@ -580,80 +759,102 @@ class Guess(object):
 
     @staticmethod
     def literal(value):
+        # [1 x 1] => [1, 1]
         return ast.literal_eval(value.replace(" x ", ","))
 
     def guess(self):
         return self.value
 
-    @abc.abstractmethod
-    def get_fix(self, error_message: str, pass_number: int):
-        raise NotImplementedError()
-
     def __str__(self):
         return str(self.value)
 
-    def get_fix(self, error_message: str, pass_number: int):
-        if pass_number > 0:
-            return
+    def get_fix(self, error_message: str, pass_number: int, name: str):
+        pass
 
-        def fix_unpack_int():
-            if isinstance(self.value, int):
-                return [TensorGuess.default_size] * 2
+    def rollback(self):
+        pass
 
-        def fix_too_many(want):
-            try:
-                if len(self.value) > want:
-                    return [TensorGuess.default_size] * want
-            except TypeError:
-                pass
 
-        def fix_too_few(want, got):
-            try:
-                if len(self.value) == got:
-                    return [TensorGuess.default_size] * want
-            except TypeError:
-                pass
-
-        fixors = [
-            (r"TypeError: cannot unpack non-iterable int object", fix_unpack_int),
-            (r"ValueError: too many values to unpack \(expected (?P<want>\d+)\)", fix_too_many),
-            (r"ValueError: not enough values to unpack \(expected (?P<want>\d+), got (?P<got>\d+)\)", fix_too_few),
-        ]
-
-        new_value = self.apply_fixors(fixors, error_message)
-        if new_value is not None:
-            return LiteralGuess(new_value)
+def layer(in_features=None, out_features=None, bias=True):
+    if in_features and out_features:
+        return torch.nn.Linear(in_features, out_features, bias)
+    return torch.nn.ReLU()
 
 
 class LiteralGuess(Guess):
-    def get_fix(self, error_message: str, pass_number: int):
-        fix = super(LiteralGuess, self).get_fix(error_message, pass_number)
+    def get_fix(self, error_message: str, pass_number: int, name: str):
+        fix = super(LiteralGuess, self).get_fix(error_message, pass_number, name)
         if fix:
             return fix
 
         if pass_number > 0:
             return
 
-        fixors = [
-            ("TypeError: (?P<typename>'[^']+') object is not subscriptable",
-             self.fix_not_subscriptable),
-        ]
+        fixors = []
+
+        if isinstance(self.value, int):
+            fixors.extend([
+                (r"TypeError: cannot unpack non-iterable int object",
+                 lambda: [TensorGuess.default_size] * 2),
+                (r"TypeError: 'int' object is not subscriptable",
+                 lambda: [TensorGuess.default_size] * 2),
+                (r"TypeError: 'int' object is not iterable",
+                 lambda: [TensorGuess.default_size] * 2),
+                (r"TypeError: object of type 'int' has no len()",
+                 lambda: [TensorGuess.default_size] * 2),
+                (r"AttributeError: 'int' object has no attribute '(size|shape|dtype|device|ndim)'",
+                 lambda: TensorGuess([TensorGuess.default_size] * 2)),
+                (r"TypeError: int is not a Module subclass",
+                 lambda: torch.nn.ReLU()),
+                (r"DeductionFailed: TypeError: 'int' object is not callable",
+                 lambda: layer),
+                (r"ModuleList.extend should be called with an iterable, but got int",
+                 lambda: [torch.nn.ReLU()]),
+                (r"AttributeError: 'int' object has no attribute 'split'",
+                 lambda: "2,2"),
+                (r"IndexError: index 0 is out of bounds for dimension 0 with size 0",
+                 lambda: 64 if self.value < 64 else None),
+                (r"ValueError: .* must be divisible by groups",
+                 lambda: 64 if self.value < 64 else None),
+                (r"KeyError: [1-9]",
+                 lambda: self.value // 2)
+            ])
+
+        if isinstance(self.value, list):
+            def fix_too_many(want):
+                try:
+                    if len(self.value) > want:
+                        return [TensorGuess.default_size] * want
+                except TypeError:
+                    pass
+
+            def fix_too_few(want, got):
+                try:
+                    if len(self.value) == got:
+                        return [TensorGuess.default_size] * want
+                except TypeError:
+                    pass
+
+            fixors.extend([
+                (r"ValueError: too many values to unpack \(expected (?P<want>\d+)\)", fix_too_many),
+                (r"ValueError: not enough values to unpack \(expected (?P<want>\d+), got (?P<got>\d+)\)", fix_too_few),
+                (r"not supported between instances of '(list|int)' and '(list|int)'",
+                 lambda: TensorGuess.default_size),
+                (r"TypeError: 'list' object is not callable",
+                 lambda: layer),
+                (r"IndexError: list index out of range",
+                 lambda: self.value + [TensorGuess.default_size]),
+            ])
 
         new_value = self.apply_fixors(fixors, error_message)
         if new_value is not None:
+            if isinstance(new_value, Guess):
+                return new_value
             return LiteralGuess(new_value)
 
-    def fix_not_subscriptable(self, typename):
-        if typename == 'int' and isinstance(self.value, int):
+    def fix_not_subscriptable(self, typename="int"):
+        if typename == "int" and isinstance(self.value, int):
             return [TensorGuess.default_size] * 2
-
-
-class ConfigGuess(Guess):
-    def __init__(self):
-        super(ConfigGuess, self).__init__(value=MockConfig())
-
-    def get_fix(self, error_message: str, pass_number: int):
-        pass
 
 
 class TensorGuess(Guess):
@@ -665,22 +866,47 @@ class TensorGuess(Guess):
         assert all(isinstance(x, int) for x in shape)
         self.shape = shape
         self.dtype = dtype
-        self.value = torch.randn(self.shape, dtype=self.dtype)
+        if self.dtype == torch.int64:
+            # used for embedding lookups often
+            self.value = torch.zeros(self.shape, dtype=self.dtype)
+        else:
+            self.value = torch.randn(self.shape, dtype=self.dtype)
 
     def clone(self):
         return self.__class__(self.shape, self.dtype)
 
     def __str__(self):
-        return f"shape({self.shape})"
+        if self.dtype == torch.float32:
+            return f"rand({self.shape})"
+        return f"rand({self.shape}, {self.dtype})"
 
-    def get_fix(self, error_message: str, pass_number: int):
-        fix = super(TensorGuess, self).get_fix(error_message, pass_number)
+    def get_fix(self, error_message: str, pass_number: int, name: str):
+        fix = super(TensorGuess, self).get_fix(error_message, pass_number, name)
         if fix:
             return fix
 
         new_shape = self.apply_fixors(self.shape_fixors(pass_number), error_message)
-        if new_shape is not None:
+        if new_shape:
             return self.__class__(new_shape, self.dtype)
+
+        def tried_to_call():
+            keywords = ("layer", "activation", "dropout", "normalization")
+            for keyword in keywords:
+                if keyword in name:
+                    return LiteralGuess(torch.nn.ReLU())
+
+        other_fixors = [
+            (r"scalar type Long; but got torch.FloatTensor",
+             lambda: self.__class__([self.default_size], torch.int64)),
+            (r"Expected dtype int64 for index",
+             lambda: self.__class__([self.default_size], torch.int64)),
+            (r"TypeError: [']Tensor['] object is not callable", tried_to_call),
+            (r"TypeError: only integer tensors of a single element can be converted to an index",
+             lambda: LiteralGuess(0)),
+            (r"'lengths' argument should be a 1D CPU int64 tensor",
+             lambda: (self.__class__([self.default_size], torch.int64) if "len" in name else None)),
+        ]
+        return self.apply_fixors(other_fixors, error_message)
 
     def shape_fixors(self, pass_number: int):
         if pass_number == 0:
@@ -697,6 +923,8 @@ class TensorGuess(Guess):
                  self.fix_dimensions),
                 (r"input must have (?P<want>\d+) dimensions, got (?P<got>\d+)",
                  self.fix_dimensions),
+                (r"Expected (?P<want>\d+)-dimensional tensor, but got (?P<got>\d+)-dimensional tensor",
+                 self.fix_dimensions),
                 (r"The size.*[(](?P<want>\d+)[)] must match.*[(](?P<got>\d+)[)] at.*dimension (?P<dim>\d+)",
                  self.fix_dimensions_at),
                 (r"must match except in dimension \d+. Got (?P<want>\d+) and (?P<got>\d+) in dimension (?P<dim>\d+)",
@@ -707,6 +935,20 @@ class TensorGuess(Guess):
                  self.fix_dimensions),
                 (r"Expected.*size (?P<want>[\d, ()]+), got (?P<got>[\d, ()]+)",
                  self.fix_shape),
+                (r"Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor",
+                 lambda: self.shape[:-1]),
+                (r"Expected tensor to have size (?P<want>\d+) at dimension (?P<dim>\d+), but got size (?P<got>\d+)",
+                 self.fix_dimensions_at),
+                (r"RuntimeError: number of dims don't match in permute",
+                 self.fix_dimensions_unknown),
+                (r"ValueError: too many values to unpack \(expected (?P<want>\d+)\)",
+                 self.fix_dimensions),
+                (r"ValueError: not enough values to unpack \(expected (?P<want>\d+), got (?P<got>\d+)\)",
+                 self.fix_dimensions),
+                (r"expected to be in range of \[-\d+, (?P<got>\d+)\], but got (?P<want>\d+)",
+                 self.fix_dimension_out_of_range),
+                (r"sizes provided \((?P<want>\d+)\) must be greater or equal.* \((?P<got>\d+)\)",
+                 self.fix_dimensions),
             ]
         if pass_number == 1:
             return [
@@ -724,14 +966,20 @@ class TensorGuess(Guess):
                  self.fix_dimensions_at),
                 (r"expected (?P<want>\d+)D or \d+D input \(got (?P<got>\d+)D input\)",
                  self.fix_dimensions),
+                (r"Expected tensor to have size (?P<got>\d+) at dimension (?P<dim>\d+), but got size (?P<want>\d+)",
+                 self.fix_dimensions_at),
             ]
+
+    def fix_dimension_out_of_range(self, got, want):
+        if 0 <= got < want:
+            return self.fix_dimensions(want + 1, got + 1)
 
     def fix_shape(self, want, got):
         if self.shape == list(got):
             return list(want)
 
     def fix_convolution(self, weight: List[int], groups: int = 1):
-        return [self.default_size, weight[1] * groups] + [x * self.default_size for x in weight[2:]]
+        return [self.default_size, weight[1] * groups] + [64 for _ in weight[2:]]
 
     def fix_convolution_if_matching(self, weight, got, groups=1):
         if got == self.shape:
@@ -756,19 +1004,49 @@ class TensorGuess(Guess):
             shape[dim] = want
             return shape
 
+    def fix_dimensions_unknown(self):
+        shape = list(self.shape)
+        if len(shape) > 2:
+            shape.pop()
+            return
+
+
+class ConfigGuess(Guess):
+    def __init__(self):
+        super(ConfigGuess, self).__init__(value=MockConfig())
+        self._rollback = []
+
+    def get_fix(self, error_message: str, pass_number: int, name: str):
+        guesses = sorted(self.value._guesses.values(),
+                         key=lambda x: x.created, reverse=True)
+        for guess in guesses:
+            if guess.try_to_fix(error_message, pass_number):
+                self._rollback.append(guess)
+                return self
+
+    def rollback(self):
+        self._rollback.pop().rollback()
+
 
 class MockConfig(object):
     def __init__(self):
         super(MockConfig, self).__init__()
         self._guesses = dict()
-        self._values = dict()
+
+    def __str__(self):
+        return "MockConfig({})".format(
+            ", ".join(f"{key}={value}" for key, value in self._guesses.items())
+        )
 
     def __getitem__(self, item):
         if item not in self._guesses:
             self._guesses[item] = DeduceParameter.initial_arg_init(name=item, position=None)
-        return self._values[item].guess()
+        return self._guesses[item].guess()
 
     __getattr__ = __getitem__
+
+    def __iter__(self):
+        return iter([])
 
 
 class ASTCleanup(ast.NodeTransformer):
@@ -833,112 +1111,6 @@ class ExtractReadsWrites(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
     visit_ClassDef = visit_FunctionDef
     visit_Lambda = visit_FunctionDef
-
-
-class Stats(Counter):
-    """
-    Counter used to report totals by module
-    """
-
-    def __str__(self):
-        """
-        Reorder key print order by stage in the process
-        """
-        stats_keys = [
-            "total",
-            "init_ok",
-            "deduced_args_ok",
-            "jit_success",
-        ]
-        stats_keys = stats_keys + list(set(self.keys()) - set(stats_keys))
-        return str([(k, self[k]) for k in stats_keys])
-
-
-class ErrorAggregator(object):
-    """
-    Collect and group error messages for report at the end
-    """
-
-    def __init__(self, context=None, log=None):
-        super(ErrorAggregator, self).__init__()
-        self.context = context
-        self.error_groups = []
-        self.bigram_to_group_ids = defaultdict(list)
-        self.log = log or logging.getLogger(__name__)
-
-    def record(self, e: Exception):
-        ex_msg = str(e).strip().split('\n')[0]
-        error_msg = f"{e.__class__.__name__}: {ex_msg}"
-        if self._add(error_msg, [(error_msg, self.context)]):
-            log.exception('New Error')
-
-    def update(self, other):
-        for errors in other.error_groups:
-            self._add(errors[0][0], errors)
-
-    def _add(self, error_msg: str, errors: List):
-        msg_words = list(re.findall(r"[a-zA-Z]+", error_msg))
-        msg_bigrams = [f"{a}_{b}" for a, b in zip(msg_words, msg_words[1:])] or msg_words
-
-        shared_bigrams = Counter()
-        for bigram in msg_bigrams:
-            shared_bigrams.update(self.bigram_to_group_ids[bigram])
-
-        if shared_bigrams:
-            best_match, count = shared_bigrams.most_common(1)[0]
-            if count > len(msg_bigrams) // 2:
-                self.error_groups[best_match].extend(errors)
-                return False
-
-        # No match, create a new error group
-        group_id = len(self.error_groups)
-        self.error_groups.append(errors)
-        for bigram in msg_bigrams:
-            self.bigram_to_group_ids[bigram].append(group_id)
-
-        return True
-
-    @staticmethod
-    def format_error_group(errors):
-        context, context_count = Counter(context for msg, context in errors).most_common(1)[0]
-        return f"  - {len(errors)} errors like: {errors[0][0]} ({context_count} from {context})"
-
-    def __str__(self):
-        errors = sorted(self.error_groups, key=len, reverse=True)
-        return '\n'.join(map(self.format_error_group, errors[:20]))
-
-    def __len__(self):
-        return sum(map(len, self.error_groups))
-
-
-class ErrorAggregatorDict(object):
-    @classmethod
-    def single(cls, name: str, e: Exception, context=None):
-        errors = cls(context)
-        errors[name].record(e)
-        return errors
-
-    def __init__(self, context=None):
-        super(ErrorAggregatorDict, self).__init__()
-        self.aggregator = dict()
-        self.context = context
-        if context:
-            self.name = re.sub(r"[.]zip$", "", os.path.basename(context))
-        else:
-            self.name = __name__
-
-    def __getitem__(self, item):
-        if item not in self.aggregator:
-            self.aggregator[item] = ErrorAggregator(self.context, logging.getLogger(f"{item}.{self.name}"))
-        return self.aggregator[item]
-
-    def update(self, other):
-        for key, value in other.aggregator.items():
-            self[key].update(other=value)
-
-    def print_report(self):
-        for name in sorted(list(self.aggregator.keys())):
-            self[name].log.info(f"\nTop errors in {name} ({len(self[name])} total):\n{self[name]}\n")
 
 
 class CrawlGitHub(object):
@@ -1008,62 +1180,91 @@ class CrawlGitHub(object):
 
 
 def test_all(download_dir, limit=None):
+    start = time.time()
     limit = limit or float('inf')
     stats = Stats()
     errors = ErrorAggregatorDict()
-    for filename in os.listdir(download_dir):
-        if filename.endswith('.zip'):
-            errors_part, stats_part = test_zipfile(os.path.join(download_dir, filename))
-            errors.update(errors_part)
-            stats.update(stats_part)
-            limit -= 1
-            if limit == 0:
-                break
+    zipfiles = [os.path.join(download_dir, f)
+                for f in os.listdir(download_dir)
+                if f.endswith(".zip")]
+    if limit:
+        zipfiles = zipfiles[:limit]
+
+    pool = ThreadPool(8)
+    for errors_part, stats_part in pool.imap_unordered(test_zipfile, zipfiles):
+        errors.update(errors_part)
+        stats.update(stats_part)
+    pool.close()
     errors.print_report()
-    log.info(f"TOTAL: {stats}")
+    log.info(f"TOTAL: {stats}, took {time.time() - start:.1f} seconds")
 
 
 def test_zipfile(path):
-    parent_conn, child_conn = multiprocessing.Pipe()
-    start = time.time()
-
     with tempfile.TemporaryDirectory(prefix="paritybench") as tempdir:
-        proc = multiprocessing.Process(target=test_zipfile_subproc, args=(tempdir, path, child_conn))
-        proc.start()
-        while proc.is_alive():
-            if parent_conn.poll(1):
-                result = parent_conn.recv()
-                proc.join()
-                return result
-            if time.time() - start > 60:
-                proc.terminate()
-                proc.join(10)
-                return ErrorAggregatorDict.single(
-                    "meta",
-                    TimeoutError("Timeout testing module"),
-                    path
-                ), Stats({"timeout": 1})
-
-        proc.join()
-        if proc.exitcode == 0:
-            return parent_conn.recv()
-        else:
+        try:
+            return call_with_timeout(test_zipfile_subproc, (tempdir, path), {}, timeout=120)
+        except TimeoutError:
             return ErrorAggregatorDict.single(
                 "meta",
-                MemoryError("Crash testing module"),
+                TimeoutError("Timeout testing module"),
+                path
+            ), Stats({"timeout": 1})
+        except OSError:
+            return ErrorAggregatorDict.single(
+                "meta",
+                OSError("Crash testing module"),
                 path
             ), Stats({"crash": 1})
 
 
-def test_zipfile_subproc(tempdir: str, path: str, return_pipe: multiprocessing.Pipe):
+def call_with_timeout(fn, args, kwargs, timeout=10):
+    parent_conn, child_conn = multiprocessing.Pipe()
+    start = time.time()
+    proc = multiprocessing.Process(target=call_with_timeout_subproc, args=(fn, args, kwargs, child_conn))
+    proc.start()
+    while proc.is_alive():
+        if parent_conn.poll(1):
+            result = parent_conn.recv()
+            proc.join()
+            return result
+        if time.time() - start > timeout:
+            os.kill(proc.pid, signal.SIGINT)
+            time.sleep(1)
+            proc.terminate()
+            proc.join(10)
+            raise TimeoutError(f"took longer than {timeout} seconds")
+
+    proc.join()
+    if proc.exitcode == 0:
+        return parent_conn.recv()
+    else:
+        raise OSError(f"exitcode should be 0, got {proc.exitcode}")
+
+
+def call_with_timeout_subproc(fn, args, kwargs, return_pipe):
     _, hard = resource.getrlimit(resource.RLIMIT_AS)
     resource.setrlimit(resource.RLIMIT_AS, (10 * 1024 ** 3, hard))
+    try:
+        result = fn(*args, *kwargs)
+    except Exception:
+        log.exception("Error from subprocess")
+    return_pipe.send(result)
+
+
+def test_zipfile_subproc(tempdir: str, path: str):
+    altpath = re.sub(r"\.[a-z]{1,3}$", ".zip", path)
+    if os.path.exists(altpath):
+        path = altpath
 
     errors = ErrorAggregatorDict(path)
     stats = Stats()
-    extractor = PyTorchModuleExtractor(tempdir, errors, stats)
-    extractor.main(path)
-    return_pipe.send((errors, stats))
+    with open(re.sub(r"([.]zip|/)$", "", path) + ".py", "w") as output_py:
+        extractor = PyTorchModuleExtractor(tempdir, errors, stats, output_py=output_py)
+
+        with patch.object(torch.Tensor, "cuda", lambda x: x):
+            extractor.main(path)
+
+    return errors, stats
 
 
 def main():
@@ -1071,6 +1272,7 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--download", action="store_true")
     group.add_argument("--run")
+    group.add_argument("--run-direct")
     parser.add_argument("--download-dir", "-d", default="../paritybench_download")
     parser.add_argument("--limit", "-l", type=int)
     args = parser.parse_args()
@@ -1084,6 +1286,12 @@ def main():
         errors, stats = test_zipfile(args.run)
         errors.print_report()
         log.info(f"Stats: {stats}")
+        return
+
+    if args.run_direct:
+        assert os.path.isfile(args.run_direct)
+        with tempfile.TemporaryDirectory(prefix="paritybench") as tempdir:
+            test_zipfile_subproc(tempdir, args.run_direct)
         return
 
     test_all(args.download_dir, args.limit)
