@@ -39,34 +39,43 @@ IMPORT_WHITELIST = {
     # TODO: torchvision/torchaudio/etc is used by many
     "abc",
     "collections",
+    "copy",
+    "enum",
     "functools",
     "inspect",
     "itertools",
     "logging",
     "math",
     "numpy",
-    "warnings",
-    "random"
     "random",
+    "re",
     "scipy",
+    "string",
     "torch",
     "types",
     "typing",
-    "string"
     "uuid",
-    "re",
-    "enum",
+    "warnings",
 }
+CONFIG_NAMES = {"argv", "args", "config", "cfg", "params", "_global_config"}
+PREFIX = f'''
+__version__ = "1.0.0"
 
-PREFIX = '''
 from unittest.mock import mock_open, MagicMock
 open = mock_open()
-args = config = cfg = argparse = MagicMock()
-__version__ = "0.0.0"
+logging = sys = argparse = MagicMock()
+ArgumentParser = argparse.ArgumentParser
 from torch.autograd import Function
 from torch.nn import Module
-'''
 
+class _config(dict):
+    __getattr__ = dict.__getitem__
+
+{" = ".join(sorted(CONFIG_NAMES))} = _config()
+argparse.ArgumentParser.return_value.parse_args.return_value = _global_config
+sys.argv = _global_config
+
+'''
 SUFFIX = '''
 import torch, unittest, copy
 from torch.testing._internal.jit_utils import JitTestCase
@@ -149,7 +158,8 @@ class ErrorAggregator(object):
     def record(self, e: Exception, module):
         ex_msg = str(e).strip().split('\n')[0]
         error_msg = f"{e.__class__.__name__}: {ex_msg}"
-        return self._add(error_msg, [(error_msg, f"{self.context}:{module}")])
+        full_msg = f"{e.__class__.__name__}: {str(e)}"
+        return self._add(error_msg, [(error_msg, f"{self.context}:{module}", full_msg)])
 
     def update(self, other):
         for errors in other.error_groups:
@@ -182,7 +192,7 @@ class ErrorAggregator(object):
 
     @staticmethod
     def format_error_group(errors):
-        context, context_count = random.choice(list(Counter(context for msg, context in errors).items()))
+        context, context_count = random.choice(list(Counter(context for msg, context, _ in errors).items()))
         return f"  - {len(errors)} errors like: {errors[0][0]} (example {context})"
 
     def __str__(self):
@@ -191,6 +201,13 @@ class ErrorAggregator(object):
 
     def __len__(self):
         return sum(map(len, self.error_groups))
+
+    csv_headers = ["phase", "count", "example_short", "example_long", "example_from"]
+
+    def write_csv(self, phase, out: csv.writer):
+        for errors in sorted(self.error_groups, key=len, reverse=True)[:20]:
+            short, context, long = random.choice(errors)
+            out.writerow([phase, len(errors), short, long, context])
 
 
 class ErrorAggregatorDict(object):
@@ -226,6 +243,12 @@ class ErrorAggregatorDict(object):
         for name in sorted(list(self.aggregator.keys())):
             self[name].log.info(f"\nTop errors in {name} ({len(self[name])} total):\n{self[name]}\n")
 
+        with open('errors.csv', "w") as fd:
+            out = csv.writer(fd)
+            out.writerow(ErrorAggregator.csv_headers)
+            for name in sorted(list(self.aggregator.keys())):
+                self[name].write_csv(name, out)
+
     def record(self, error_type, error, module=None):
         module = str(getattr(module, "__name__", module))
         if self[error_type].record(error, module):
@@ -253,6 +276,7 @@ class PyTorchModuleExtractor(object):
 
         self.available_symbols = dict()
         self.testcases = []
+        self.global_config = None
 
     def search_file(self, filename: str, open_fn=open):
         if not filename.endswith(".py") or re.search(r"output\.py$", filename):
@@ -391,6 +415,7 @@ class PyTorchModuleExtractor(object):
 
     def construct_module(self):
         self.run_statement(self.ast_parse(PREFIX, "<string>"), source_required=True)
+        self.global_config = self.output_module.__dict__["_global_config"]
 
         for statement in self.imports.values():
             try:
@@ -417,12 +442,25 @@ class PyTorchModuleExtractor(object):
         :param statement: ast.Node to add to the module
         """
         reads, writes = ExtractReadsWrites.run(statement)
+        need_config = False
         for name in reads - writes:
             if (name in self.available_symbols and
                     getattr(self.output_module, name, self.output_module) is self.output_module):
                 requirement = self.available_symbols.pop(name)
                 self.add_requirements(requirement)
                 self.run_statement(requirement, source_required=True)
+            elif name in CONFIG_NAMES:
+                need_config = True
+
+        if need_config:
+            try:
+                for key in ExtractConfigUsage.run(statement):
+                    if key not in self.global_config:
+                        value = repr(DeduceParameter.initial_arg_init(key, None))
+                        self.run_statement(self.ast_parse(f"_global_config['{key}'] = {value}\n", "<string>"),
+                                           source_required=True)
+            except Exception:
+                log.exception("global_config error")
 
     def run_statement(self, statement, source_required=False):
         source = to_source(statement)
@@ -1211,8 +1249,8 @@ class ExtractReadsWrites(ast.NodeVisitor):
         return visitor.context[0]
 
     def __init__(self):
-        super(ExtractReadsWrites, self).__init__()
-        self.context = [(set(), set())]  # Read/Writs
+        super().__init__()
+        self.context = [(set(), set())]  # Read/Writes
 
     def visit_Global(self, node):
         global_reads, global_writes = self.context[0]
@@ -1251,6 +1289,38 @@ class ExtractReadsWrites(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
     visit_ClassDef = visit_FunctionDef
     visit_Lambda = visit_FunctionDef
+
+    def visit_arg(self, node):
+        reads, writes = self.context[-1]
+        writes.add(node.arg)
+
+
+class ExtractConfigUsage(ast.NodeVisitor):
+    """
+    Find items like `config.hidden_size` and return {"hidden_size"}
+    """
+    @classmethod
+    def run(cls, tree):
+        visitor = cls()
+        visitor.visit(tree)
+        return visitor.needed_keys
+
+    def __init__(self):
+        super().__init__()
+        self.needed_keys = set()
+
+    def visit_Attribute(self, node):
+        lhs = getattr(node.value, "id", "")
+        if lhs in CONFIG_NAMES:
+            self.needed_keys.add(node.attr)
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        lhs = getattr(node.value, "id", "")
+        rhs = getattr(getattr(node.slice, "value", ""), "value", "")
+        if lhs in CONFIG_NAMES and rhs and isinstance(rhs, (str, int)):
+            self.needed_keys.add(rhs)
+        self.generic_visit(node)
 
 
 class CrawlGitHub(object):
