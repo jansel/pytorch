@@ -469,7 +469,7 @@ class PyTorchModuleExtractor(object):
         else:
             # TorchScript requires source code to exist on disk
             assert self.tempdir
-            fn, filename = tempfile.mkstemp(suffix='.py', dir=self.tempdir, )
+            fn, filename = tempfile.mkstemp(suffix='.py', dir=self.tempdir, prefix="pb")
             with os.fdopen(fn, "w") as fd:
                 fd.write(source)
                 fd.flush()
