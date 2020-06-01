@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ast
+import csv
 import inspect
 import itertools
 import json
@@ -54,7 +55,9 @@ IMPORT_WHITELIST = {
     "string"
     "uuid",
     "re",
+    "enum",
 }
+
 PREFIX = '''
 from unittest.mock import mock_open, MagicMock
 open = mock_open()
@@ -62,6 +65,50 @@ args = config = cfg = argparse = MagicMock()
 __version__ = "0.0.0"
 from torch.autograd import Function
 from torch.nn import Module
+'''
+
+SUFFIX = '''
+import torch, unittest, copy
+from torch.testing._internal.jit_utils import JitTestCase
+
+
+def _layer(in_features=None, out_features=None, bias=True):
+    if in_features and out_features:
+        return torch.nn.Linear(in_features, out_features, bias)
+    return torch.nn.ReLU()
+
+class _config(dict):
+    __getattr__ = dict.__getitem__
+
+
+class Test_{basename}(JitTestCase):
+    def _check(self, script, args, kwargs):
+        import os
+        try:
+            script.eval()
+        except:
+            pass
+        result1 = script(*copy.deepcopy(args), **copy.deepcopy(kwargs))
+        result2 = script(*copy.deepcopy(args), **copy.deepcopy(kwargs))
+        if os.environ.get('TEST_PY_ONLY'):
+            return
+        jit_script = torch.jit.script(script)
+        if os.environ.get('TEST_COMPILE_ONLY'):
+            return
+        result3 = jit_script(*args, **kwargs)
+        if os.environ.get('TEST_RUN_ONLY'):
+            return
+        try:
+            self.assertEqual(result1, result2)
+        except AssertionError:
+            return  # output is not deterministic
+        self.assertEqual(result2, result3)
+
+'''
+
+TESTCASE_TEMPLATE = '''
+    def test_{index:03}(self):
+        self._check({script}, {args}, {kwargs})
 '''
 
 
@@ -205,6 +252,7 @@ class PyTorchModuleExtractor(object):
         self.module_statements = []
 
         self.available_symbols = dict()
+        self.testcases = []
 
     def search_file(self, filename: str, open_fn=open):
         if not filename.endswith(".py") or re.search(r"output\.py$", filename):
@@ -334,6 +382,8 @@ class PyTorchModuleExtractor(object):
         :param name: alternate name for self.output_module
         :param overwrite: if true, replace an existing symbol
         """
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+            return
         if name in self.output_module.__dict__ and not overwrite:
             return
         self.output_module.__dict__[name] = self.output_module
@@ -432,6 +482,12 @@ class PyTorchModuleExtractor(object):
 
         self.stats["jit_compiles"] += 1
 
+        self.testcases.append((
+            name,
+            init_deducer.testcase_args(),
+            forward_deducer.testcase_args()
+        ))
+
         if not RUN_SCRIPT:
             return
 
@@ -465,6 +521,8 @@ class PyTorchModuleExtractor(object):
             tc.assertEqual(a, b)
 
     def main(self, filename: str):
+        basename = re.sub(r"[.]zip$", "", os.path.basename(filename))
+
         self.output_py.writelines([
             "import sys\n",
             "_module = sys.modules[__name__]\n",
@@ -475,11 +533,27 @@ class PyTorchModuleExtractor(object):
         else:
             self.search_zipfile(filename)
 
-        # self.debug_output()
         self.construct_module()
         self.test_modules()
-        basename = re.sub(r"[.]zip$", "", os.path.basename(filename))
+        self.write_testcases(basename)
+
         log.info(f"{basename}: {self.stats}")
+
+    def write_testcases(self, basename):
+        self.output_py.write(SUFFIX.format(basename=basename))
+        index = 0
+        for name, init_args, forward_args in self.testcases:
+            script = f"{name}(*{init_args[0]}, **{init_args[1]})"
+            args, kwargs = forward_args
+            if kwargs:
+                self.output_py.writelines(TESTCASE_TEMPLATE.format(
+                    index=index,
+                    script=script,
+                    args=args,
+                    kwargs=kwargs,
+                ))
+
+            index += 1
 
 
 class DeductionFailed(RuntimeError):
@@ -531,6 +605,9 @@ class DeduceParameters(object):
         return ", ".join(itertools.chain(
             map(str, self.args),
             [f"{name}={arg}" for name, arg in self.kwargs.items()]))
+
+    def testcase_args(self):
+        return repr(self.args), repr(self.kwargs)
 
     @classmethod
     def run(cls, nn_module: Callable, needed_args: List[inspect.Parameter]):
@@ -706,6 +783,11 @@ class DeduceParameter(object):
         self.position = position
         self._guesses = [initial_guess]
 
+    def __str__(self):
+        return str(self._guesses[-1])
+
+    __repr__ = __str__
+
     @property
     def created(self):
         return self._guesses[-1].created
@@ -737,9 +819,6 @@ class DeduceParameter(object):
         self._guesses[-1].rollback()
         self._guesses.pop()
 
-    def __str__(self):
-        return str(self._guesses[-1])
-
     def is_shape_match(self, shape):
         if isinstance(self._guesses[-1], TensorGuess):
             return self._guesses[-1].shape == shape
@@ -765,6 +844,13 @@ class Guess(object):
         super(Guess, self).__init__()
         self.value = value
         self.created = time.time()
+
+    def __str__(self):
+        if self.value is _layer:
+            return '_layer'
+        return repr(self.value)
+
+    __repr__ = __str__
 
     @staticmethod
     def apply_fixors(fixors, error_msg):
@@ -901,7 +987,12 @@ class TensorGuess(Guess):
     def __str__(self):
         if self.dtype == torch.float32:
             return f"torch.rand({self.shape})"
-        return f"torch.rand({self.shape}, dtype={self.dtype})"
+        elif self.dtype == torch.int64:
+            return f"torch.zeros({self.shape}, dtype={self.dtype})"
+        else:
+            return f"torch.rand({self.shape}, dtype={self.dtype})"
+
+    __repr__ = __str__
 
     def get_fix(self, error_message: str, pass_number: int, name: str):
         fix = super(TensorGuess, self).get_fix(error_message, pass_number, name)
@@ -1080,7 +1171,7 @@ class MockConfig(object):
         self._guesses = dict()
 
     def __str__(self):
-        return "MockConfig({})".format(
+        return "_config({})".format(
             ", ".join(f"{key}={value}" for key, value in self._guesses.items())
         )
 
@@ -1105,6 +1196,9 @@ class ASTCleanup(ast.NodeTransformer):
         if getattr(node.func, 'id', '') == 'print':
             # Strip print() calls
             return ast.Constant(value=None, kind=None)
+        if getattr(node.func, 'attr', '') == 'cuda':
+            # foo.cuda() => foo
+            return node.func.value
         return self.generic_visit(node)
 
 
