@@ -138,7 +138,7 @@ auto ConvParams::use_cpu_depthwise3x3_winograd(
     const at::Tensor& input,
     const at::Tensor& weight,
     const at::Tensor& bias) const -> bool {
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) && !defined(C10_IOS)
   // Currently only 3x3 depthwise convolutions on tensors of float are supported.
   return (input.ndimension() == 4) &&
          (input.size(1) == groups) &&
@@ -596,7 +596,7 @@ at::Tensor convolution(
   auto& ctx = at::globalContext();
   return at::_convolution(input, weight, bias, stride, padding, dilation,
                           transposed, output_padding, groups,
-                          ctx.benchmarkCuDNN(), ctx.deterministicCuDNN(), ctx.userEnabledCuDNN());
+                          ctx.benchmarkCuDNN(), ctx.deterministicCuDNN() || ctx.deterministic(), ctx.userEnabledCuDNN());
 }
 
 at::Tensor convolution_overrideable(
