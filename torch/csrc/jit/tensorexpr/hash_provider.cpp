@@ -184,11 +184,6 @@ void HashProvider::visit(const Store* v) {
 void HashProvider::visit(const Block* v) {
   CACHE_GUARD();
   SimplifierHashType hash;
-  for (const auto& pair : v->varBindings()) {
-    pair.first->accept(this);
-    pair.second->accept(this);
-    hash = hash_combine(hash, hashOf(pair.first), hashOf(pair.second));
-  }
 
   for (Stmt* s : *v) {
     s->accept(this);
@@ -237,6 +232,24 @@ void HashProvider::visit(const IfThenElse* v) {
 
 void HashProvider::visit(const BaseCallNode* v) {
   CACHE_GUARD();
+  SimplifierHashType hash(te_hash(v->func_name()));
+  for (int i = 0; i < v->nparams(); i++) {
+    v->param(i)->accept(this);
+    hash = hash_combine(hash, hashOf(v->param(i)));
+  }
+
+  putHash(v, hash);
+}
+
+void HashProvider::visit(const Intrinsics* v) {
+  CACHE_GUARD();
+  // calls to rand are not symbolic and have a different value each time, they
+  // should not hash to anything and this is the best we can do.
+  if (v->op_type() == kRand) {
+    putHash(v, (SimplifierHashType)rand());
+    return;
+  }
+
   SimplifierHashType hash(te_hash(v->func_name()));
   for (int i = 0; i < v->nparams(); i++) {
     v->param(i)->accept(this);

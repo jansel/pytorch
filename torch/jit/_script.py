@@ -12,15 +12,20 @@ import inspect
 import copy
 import pickle
 import warnings
+from typing import Any, Dict
+
 
 import torch
 import torch._jit_internal as _jit_internal
+from torch.utils import set_module
 from torch.jit._recursive import ScriptMethodStub, wrap_cpp_module
 from torch.nn import Module
 from torch.jit._state import _enabled
+from torch.jit._builtins import _register_builtin
 from torch._six import with_metaclass, get_function_from_type
 from torch.jit.frontend import get_jit_def, get_default_args, get_jit_class_def
 from torch._jit_internal import _qualified_name
+from torch.jit._fuser import _graph_for
 from torch.jit._state import (
     _try_get_jit_cached_function,
     _try_get_jit_cached_overloads,
@@ -28,11 +33,21 @@ from torch.jit._state import (
     _set_jit_overload_cache,
 )
 
+torch._C.ScriptMethod.graph_for = _graph_for  # type: ignore
+torch._C.ScriptFunction.graph_for = _graph_for  # type: ignore
+ScriptFunction = torch._C.ScriptFunction
+ScriptFunction.__doc__ = """
+Functionally equivalent to a :class:`ScriptModule`, but represents a single
+function and does not have any attributes or Parameters.
+"""
+set_module(ScriptFunction, "torch.jit")
+
+
 if _enabled:
     Attribute = collections.namedtuple("Attribute", ["value", "type"])
 else:
 
-    def Attribute(value, type):
+    def Attribute(value, type):  # type: ignore
         return value
 
 
@@ -152,7 +167,7 @@ class OrderedModuleDict(OrderedDictWrapper):
 class ScriptMeta(type):
     def __init__(cls, name, bases, attrs):  # noqa: B902
         # Aggregate all the ScriptMethods and constants from superclasses
-        cls._methods = {}
+        cls._methods: Dict[str, Any] = {}
         cls._constants_set = set(getattr(cls, "__constants__", ()))
         for base in reversed(bases):
             for k, v in getattr(base, "_methods", {}).items():
@@ -198,13 +213,13 @@ class ScriptMeta(type):
                 for name in ("_parameters", "_buffers", "_modules"):
                     delattr(self, name)
 
-        cls.__init__ = init_then_script
+        cls.__init__ = init_then_script  # type: ignore
         return super(ScriptMeta, cls).__init__(name, bases, attrs)
 
 
 class _CachedForward(object):
     def __get__(self, obj, cls):
-        return self.__getattr__("forward")
+        return self.__getattr__("forward")  # type: ignore
 
 
 class ScriptWarning(Warning):
@@ -248,7 +263,7 @@ if _enabled:
     # did nothing __getattr__ would not be called. Instead we'd get nn.Module.forward
     # which always throws an exception.
 
-    class ScriptModule(with_metaclass(ScriptMeta, Module)):
+    class ScriptModule(with_metaclass(ScriptMeta, Module)):  # type: ignore
         """
         ``ScriptModule``s wrap a C++ ``torch::jit::Module``. ``ScriptModule``s
         contain methods, attributes, parameters, and
@@ -389,7 +404,7 @@ if _enabled:
             Arguments:
                 cpp_module: The C++ module that this RecursiveScriptModule will be rebuilt around.
             """
-            self.__init__(cpp_module)
+            self.__init__(cpp_module)  # type: ignore
 
             # Copy the concrete type from the C++ module to this ScriptModule.
             self._concrete_type = torch._C.ConcreteModuleType.from_jit_type(
@@ -418,7 +433,7 @@ if _enabled:
         def graph(self):
             r"""
             Returns a string representation of the internal graph for the
-            ``forward`` method. See `interpreting-graphs`_ for details.
+            ``forward`` method. See :ref:`interpreting-graphs` for details.
             """
             return self.forward.graph
 
@@ -427,7 +442,7 @@ if _enabled:
             r"""
             Returns a string representation of the internal graph for the
             ``forward`` method. This graph will be preprocessed to inline all function and method calls.
-            See `interpreting-graphs`_ for details.
+            See :ref:`interpreting-graphs` for details.
             """
             return self.forward.inlined_graph
 
@@ -435,8 +450,8 @@ if _enabled:
         def code(self):
             r"""
             Returns a pretty-printed representation (as valid Python syntax) of
-            the internal graph for the ``forward`` method. See `inspecting-code`_
-            for details.
+            the internal graph for the ``forward`` method. See
+            :ref:`inspecting-code` for details.
             """
             return self.forward.code
 
@@ -450,14 +465,14 @@ if _enabled:
             [1] a ConstMap following the CONSTANT.cN format of the output in [0].
             The indices in the [0] output are keys to the underlying constant's values.
 
-            See `inspecting-code`_ for details.
+            See :ref:`inspecting-code` for details.
             """
             r = self.forward.code_with_constants
             return (r[0], ConstMap(r[1]))
 
         def save(self, *args, **kwargs):
             r"""
-            save(f, _extra_files=ExtraFilesMap{})
+            save(f, _extra_files={})
 
             See :func:`torch.jit.save <torch.jit.save>` for details.
             """
@@ -604,7 +619,7 @@ if _enabled:
         # it is not overriden, we call into the nn.Module __dir__ method
         def __dir__(self):
             self_method = self.__dir__
-            if self_method.__func__ == get_function_from_type(
+            if self_method.__func__ == get_function_from_type(  # type: ignore
                 RecursiveScriptModule, "__dir__"
             ):
                 return super(RecursiveScriptModule, self).__dir__()
@@ -615,7 +630,7 @@ if _enabled:
         # class throws if it isn't overriden, we define __bool__ to preserve default behavior
         def __bool__(self):
             self_method = self.__bool__
-            if self_method.__func__ == get_function_from_type(
+            if self_method.__func__ == get_function_from_type(  # type: ignore
                 RecursiveScriptModule, "__bool__"
             ):
                 return True
@@ -655,7 +670,7 @@ if _enabled:
             cls, predicate=lambda x: inspect.isfunction(x) or inspect.ismethod(x)
         )
 
-    _compiled_methods_whitelist = {
+    _compiled_methods_allowlist = {
         "forward",
         "register_buffer",
         "register_parameter",
@@ -703,19 +718,19 @@ if _enabled:
             continue
         if (
             name not in RecursiveScriptModule.__dict__
-            and name not in _compiled_methods_whitelist
+            and name not in _compiled_methods_allowlist
         ):
             setattr(RecursiveScriptModule, method.__name__, _make_fail(name))
 
 
 else:
     # TODO MAKE SURE THAT DISABLING WORKS
-    class ScriptModule(torch.nn.Module):
-        def __init__(self):
-            super(ScriptModule, self).__init__()
+    class ScriptModule(torch.nn.Module):  # type: ignore
+        def __init__(self, arg=None):
+            super().__init__()
 
-    class RecursiveScriptModule(ScriptModule):
-        def __init__(self):
+    class RecursiveScriptModule(ScriptModule):  # type: ignore
+        def __init__(self, arg=None):
             super().__init__()
 
 
@@ -821,9 +836,9 @@ def script(obj, optimize=None, _frames_up=0, _rcb=None):
                     self.conv2 = torch.jit.trace(nn.Conv2d(20, 20, 5), torch.rand(1, 20, 16, 16))
 
                 def forward(self, input):
-                  input = F.relu(self.conv1(input))
-                  input = F.relu(self.conv2(input))
-                  return input
+                    input = F.relu(self.conv1(input))
+                    input = F.relu(self.conv2(input))
+                    return input
 
             scripted_module = torch.jit.script(MyModule())
 
@@ -920,28 +935,6 @@ def script(obj, optimize=None, _frames_up=0, _rcb=None):
         fn.__doc__ = obj.__doc__
         _set_jit_function_cache(obj, fn)
         return fn
-
-
-def is_scripting():
-    r"""
-    Function that returns True when in compilation and False otherwise. This
-    is useful especially with the @unused decorator to leave code in your
-    model that is not yet TorchScript compatible.
-    .. testcode::
-
-        import torch
-
-        @torch.jit.unused
-        def unsupported_linear_op(x):
-            return x
-
-        def linear(x):
-           if not torch.jit.is_scripting():
-              return torch.linear(x)
-           else:
-              return unsupported_linear_op(x)
-    """
-    return False
 
 
 # overloads are registered in _jit_internal and compiled here so that _overload
@@ -1053,3 +1046,30 @@ def _recursive_compile_class(obj, loc):
     error_stack = torch._C.CallStack(_qual_name, loc)
     rcb = _jit_internal.createResolutionCallbackForClassMethods(obj)
     _compile_and_register_class(obj, rcb, _qual_name)
+
+
+class CompilationUnit(object):
+    def __init__(self, lang=None, _frames_up=0):
+        self._c = torch._C.CompilationUnit()
+        if lang is not None:
+            self.define(lang, _frames_up=_frames_up + 1)
+
+    def define(self, lang, rcb=None, _frames_up=0):
+        if not rcb:
+            rcb = _jit_internal.createResolutionCallbackFromFrame(_frames_up + 1)
+        self._c.define(lang, rcb)
+
+    def __getattr__(self, attr):
+        r = self._c.find_function(attr)
+        if r is None:
+            raise AttributeError("'CompilationUnit' has no attribute '{}'".format(attr))
+        return r
+
+
+def _unwrap_optional(x):
+    assert x is not None, "Unwrapping null optional"
+    return x
+
+
+_register_builtin(_unwrap_optional, "aten::_unwrap_optional")
+_register_builtin(_jit_internal.is_scripting, "aten::is_scripting")

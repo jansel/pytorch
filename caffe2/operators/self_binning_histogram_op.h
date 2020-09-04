@@ -23,7 +23,10 @@ class SelfBinningHistogramOp final : public Operator<Context> {
          {
     CAFFE_ENFORCE_GE(
         num_bins_, 1, "Number of bins must be greater than or equal to 1.");
-    CAFFE_ENFORCE(bin_spacing_ == "linear" or bin_spacing_ == "logarithmic", "");
+    CAFFE_ENFORCE(
+        bin_spacing_ == "linear" || bin_spacing_ == "logarithmic",
+        "Bin spacing can be one of 'linear' or 'logarithmic'."
+    );
     CAFFE_ENFORCE_GT(
       logspace_start_, 0,
       "Logarithmic spacing base is a multiplier and is expected to be >1.");
