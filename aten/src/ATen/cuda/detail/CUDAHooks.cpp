@@ -21,11 +21,15 @@
 #endif
 
 #ifdef USE_MAGMA
-#include <magma.h>
+#include <magma_v2.h>
 #endif
 
 #ifdef __HIP_PLATFORM_HCC__
 #include <miopen/version.h>
+#endif
+
+#ifndef USE_ROCM
+#include <ATen/cuda/detail/LazyNVRTC.h>
 #endif
 
 #include <cuda.h>
@@ -39,6 +43,8 @@ namespace at {
 namespace cuda {
 namespace detail {
 
+std::function<void(void)> THCMagma_init;
+
 // NB: deleter is dynamic, because we need it to live in a separate
 // compilation unit (alt is to have another method in hooks, but
 // let's not if we don't need to!)
@@ -47,9 +53,8 @@ std::unique_ptr<THCState, void (*)(THCState*)> CUDAHooks::initCUDA() const {
   THCState* thc_state = THCState_alloc();
 
   THCudaInit(thc_state);
-#ifdef USE_MAGMA
-  THCMagma_init(thc_state);
-#endif
+  if (THCMagma_init)
+    THCMagma_init();
   return std::unique_ptr<THCState, void (*)(THCState*)>(
       thc_state, [](THCState* p) {
         if (p)
@@ -116,9 +121,13 @@ bool CUDAHooks::hasCuDNN() const {
   return AT_CUDNN_ENABLED();
 }
 
-#ifdef USE_DIRECT_NVRTC
+#if defined(USE_DIRECT_NVRTC)
 static std::pair<std::unique_ptr<at::DynamicLibrary>, at::cuda::NVRTC*> load_nvrtc() {
   return std::make_pair(nullptr, at::cuda::load_nvrtc());
+}
+#elif !defined(USE_ROCM)
+static std::pair<std::unique_ptr<at::DynamicLibrary>, at::cuda::NVRTC*> load_nvrtc() {
+  return std::make_pair(nullptr, &at::cuda::detail::lazyNVRTC);
 }
 #else
 static std::pair<std::unique_ptr<at::DynamicLibrary>, at::cuda::NVRTC*> load_nvrtc() {
@@ -155,7 +164,9 @@ bool CUDAHooks::hasPrimaryContext(int64_t device_index) const {
   TORCH_CHECK(device_index >= 0 && device_index < at::cuda::device_count(),
               "hasPrimaryContext expects a valid device index, but got device_index=", device_index);
   unsigned int ctx_flags;
-  int ctx_is_active;
+  // In standalone tests of cuDevicePrimaryCtxGetState, I've seen the "active" argument end up with weird
+  // (garbage-looking nonzero) values when the context is not active, unless I initialize it to zero.
+  int ctx_is_active = 0;
   AT_CUDA_DRIVER_CHECK(CUDAHooks::nvrtc().cuDevicePrimaryCtxGetState(device_index, &ctx_flags, &ctx_is_active));
   return ctx_is_active == 1;
 }
@@ -195,7 +206,6 @@ bool CUDAHooks::compiledWithMIOpen() const {
 
 bool CUDAHooks::supportsDilatedConvolutionWithCuDNN() const {
 #if AT_CUDNN_ENABLED()
-  cudaDeviceProp* prop = at::cuda::getCurrentDeviceProperties();
   // NOTE: extra parenthesis around numbers disable clang warnings about
   // dead code
   return true;
@@ -324,39 +334,28 @@ double CUDAHooks::batchnormMinEpsilonCuDNN() const {
 }
 
 int64_t CUDAHooks::cuFFTGetPlanCacheMaxSize(int64_t device_index) const {
-#ifndef __HIP_PLATFORM_HCC__
   return at::native::detail::cufft_get_plan_cache_max_size_impl(device_index);
-#else
-  AT_ERROR("cuFFT with HIP is not supported");
-#endif
 }
 
 void CUDAHooks::cuFFTSetPlanCacheMaxSize(int64_t device_index, int64_t max_size) const {
-#ifndef __HIP_PLATFORM_HCC__
   at::native::detail::cufft_set_plan_cache_max_size_impl(device_index, max_size);
-#else
-  AT_ERROR("cuFFT with HIP is not supported");
-#endif
 }
 
 int64_t CUDAHooks::cuFFTGetPlanCacheSize(int64_t device_index) const {
-#ifndef __HIP_PLATFORM_HCC__
   return at::native::detail::cufft_get_plan_cache_size_impl(device_index);
-#else
-  AT_ERROR("cuFFT with HIP is not supported");
-#endif
 }
 
 void CUDAHooks::cuFFTClearPlanCache(int64_t device_index) const {
-#ifndef __HIP_PLATFORM_HCC__
   at::native::detail::cufft_clear_plan_cache_impl(device_index);
-#else
-  AT_ERROR("cuFFT with HIP is not supported");
-#endif
 }
 
 int CUDAHooks::getNumGPUs() const {
   return at::cuda::device_count();
+}
+
+void CUDAHooks::deviceSynchronize(int64_t device_index) const {
+  at::DeviceGuard device_guard(at::Device(at::DeviceType::CUDA, device_index));
+  c10::cuda::device_synchronize();
 }
 
 // Sigh, the registry doesn't support namespaces :(

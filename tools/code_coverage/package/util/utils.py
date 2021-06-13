@@ -2,9 +2,16 @@ import os
 import shutil
 import sys
 import time
-from typing import Any
+from typing import Any, NoReturn, Optional
 
-from .setting import LOG_DIR, PROFILE_DIR, TestList, TestPlatform, TestType
+from .setting import (
+    LOG_DIR,
+    PROFILE_DIR,
+    CompilerType,
+    TestList,
+    TestPlatform,
+    TestType,
+)
 
 
 def convert_time(seconds: float) -> str:
@@ -64,7 +71,7 @@ def convert_to_relative_path(whole_path: str, base_path: str) -> str:
     return whole_path[len(base_path) + 1 :]
 
 
-def replace_extension(filename, ext):
+def replace_extension(filename: str, ext: str) -> str:
     return filename[: filename.rfind(".")] + ext
 
 
@@ -80,9 +87,20 @@ def get_raw_profiles_folder() -> str:
     return os.environ.get("RAW_PROFILES_FOLDER", os.path.join(PROFILE_DIR, "raw"))
 
 
-# TODO auto detect
-def get_cov_type() -> str:
-    return os.environ.get("COMPILER_TYPE", "CLANG")
+def detect_compiler_type(platform: TestPlatform) -> CompilerType:
+    if platform == TestPlatform.OSS:
+        from package.oss.utils import detect_compiler_type  # type: ignore[misc]
+
+        cov_type = detect_compiler_type()  # type: ignore[call-arg]
+    else:
+        from caffe2.fb.code_coverage.tool.package.fbcode.utils import (  # type: ignore[import]
+            detect_compiler_type,
+        )
+
+        cov_type = detect_compiler_type()
+
+    check_compiler_type(cov_type)
+    return cov_type
 
 
 def get_test_name_from_whole_path(path: str) -> str:
@@ -93,8 +111,8 @@ def get_test_name_from_whole_path(path: str) -> str:
     return path[start + 1 : end]
 
 
-def check_compiler_type(cov_type: str) -> None:
-    if cov_type in ["CLANG", "GCC"]:
+def check_compiler_type(cov_type: Optional[CompilerType]) -> None:
+    if cov_type is not None and cov_type in [CompilerType.GCC, CompilerType.CLANG]:
         return
     raise Exception(
         f"Can't parse compiler type: {cov_type}.",
@@ -120,7 +138,7 @@ def check_test_type(test_type: str, target: str) -> None:
     )
 
 
-def raise_no_test_found_exception(cpp_binary_folder: str, python_binary_folder: str):
+def raise_no_test_found_exception(cpp_binary_folder: str, python_binary_folder: str) -> NoReturn:
     raise RuntimeError(
         f"No cpp and python tests found in folder **{cpp_binary_folder} and **{python_binary_folder}**"
     )

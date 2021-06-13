@@ -25,12 +25,16 @@
 
 namespace torch {
 namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::unordered_map<at::DeprecatedTypeProperties*, PyTypeObject*> attype_to_py_storage_type;
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::unordered_map<PyTypeObject*, at::DeprecatedTypeProperties*> py_storage_type_to_attype;
 
+// NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables,cppcoreguidelines-avoid-c-arrays)
 THPDtype* dtype_registry
   [static_cast<int>(at::ScalarType::NumOptions)] = {};
 
+// NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables,cppcoreguidelines-avoid-c-arrays)
 THPLayout* layout_registry
   [static_cast<int>(at::Layout::NumOptions)] = {};
 
@@ -59,11 +63,14 @@ at::DeprecatedTypeProperties* get_type(at::Backend backend, at::ScalarType scala
 
 PyTypeObject* getPyTypeObject(
     const at::Storage& storage,
-    const caffe2::TypeMeta& dtype) {
+    const caffe2::TypeMeta dtype) {
+  // TODO: https://github.com/pytorch/pytorch/issues/47442
+  if (storage.device_type() == at::DeviceType::Meta) {
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "python bindings for meta storage objects not supported");
+  }
   at::ScalarType scalarType = at::typeMetaToScalarType(dtype);
-  at::TensorOptions options = at::TensorOptions(storage.device_type()).dtype(scalarType);
   auto attype = &at::getDeprecatedTypeProperties(
-      at::dispatchKeyToBackend(at::computeDispatchKey(options)),
+      at::dispatchKeyToBackend(c10::computeDispatchKey(scalarType, c10::nullopt, storage.device_type())),
       scalarType);
   auto it = attype_to_py_storage_type.find(attype);
   if (it != attype_to_py_storage_type.end()) {
@@ -107,7 +114,7 @@ THPLayout* getTHPLayout(at::Layout layout) {
 
 PyObject* createPyObject(
     const at::Storage& storage,
-    const caffe2::TypeMeta& data_type) {
+    const caffe2::TypeMeta data_type) {
   auto type = getPyTypeObject(storage, data_type);
   auto obj = THPObjectPtr(type->tp_alloc(type, 0));
   if (!obj) throw python_error();

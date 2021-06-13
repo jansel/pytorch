@@ -42,9 +42,12 @@ static OpSchema::Cost CostInferenceForAdagrad(
   return c;
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_CPU_OPERATOR(Adagrad, AdagradOp<CPUContext>);
 // For backward compatibility
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_CPU_OPERATOR_WITH_ENGINE(Adagrad, SIMD, AdagradOp<CPUContext>);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 OPERATOR_SCHEMA(Adagrad)
     .NumInputs(4)
     .NumOutputs(2, 4)
@@ -108,9 +111,12 @@ static OpSchema::Cost CostInferenceForSparseAdagrad(
   return c;
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_CPU_OPERATOR(SparseAdagrad, SparseAdagradOp);
 // For backward compatibility
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_CPU_OPERATOR_WITH_ENGINE(SparseAdagrad, SIMD, SparseAdagradOp);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 OPERATOR_SCHEMA(SparseAdagrad)
     .NumInputs(5)
     .NumOutputs(2)
@@ -147,41 +153,45 @@ static OpSchema::Cost CostInferenceForRowWiseSparseAdagrad(
 
   uint64_t n = nElemFromDim(indices);
   uint64_t grad_size = nElemFromDim(grad);
-  auto block_size = grad_size / n;
-
   OpSchema::Cost c;
-  if (block_size == 1) {
-    // +2: applying weight decay and add to grads
-    // +2: updading moments
-    // +5: updating params
-    c.flops = n * 9;
-    c.bytes_written =
-        n * (sizeof(param.data_type()) + sizeof(moment.data_type()));
-    c.bytes_read = c.bytes_written +
-        n *
-            (sizeof(grad.data_type()) + sizeof(indices.data_type()) +
-             sizeof(lr.data_type()));
-  } else {
-    // 5 per block (not counting index transforms)
-    // 8 for each value of a block
-    c.flops = n * (5 + (block_size * 8));
-    c.bytes_written =
-        n * sizeof(moment.data_type()) + n * block_size * (param.data_type());
 
-    c.bytes_read = c.bytes_written + n * (sizeof(lr.data_type())) +
-        2 * n * block_size *
-            (sizeof(grad.data_type()) + sizeof(param.data_type()));
+  if (n > 0) {
+    auto block_size = grad_size / n;
+    if (block_size == 1) {
+      // +2: applying weight decay and add to grads
+      // +2: updading moments
+      // +5: updating params
+      c.flops = n * 9;
+      c.bytes_written =
+          n * (sizeof(param.data_type()) + sizeof(moment.data_type()));
+      c.bytes_read = c.bytes_written +
+          n *
+              (sizeof(grad.data_type()) + sizeof(indices.data_type()) +
+               sizeof(lr.data_type()));
+    } else {
+      // 5 per block (not counting index transforms)
+      // 8 for each value of a block
+      c.flops = n * (5 + (block_size * 8));
+      c.bytes_written =
+          n * sizeof(moment.data_type()) + n * block_size * (param.data_type());
+
+      c.bytes_read = c.bytes_written + n * (sizeof(lr.data_type())) +
+          2 * n * block_size *
+              (sizeof(grad.data_type()) + sizeof(param.data_type()));
+    }
   }
-
   return c;
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_CPU_OPERATOR(RowWiseSparseAdagrad, RowWiseSparseAdagradOp<CPUContext>);
 // For backward compatibility
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 REGISTER_CPU_OPERATOR_WITH_ENGINE(
     RowWiseSparseAdagrad,
     SIMD,
     RowWiseSparseAdagradOp<CPUContext>);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 OPERATOR_SCHEMA(RowWiseSparseAdagrad)
     .NumInputs(5)
     .NumOutputs(2)
@@ -208,7 +218,10 @@ also be a 1D tensor indexing into the rows of param.
     .CostInferenceFunction(
         OpSchema::CostInferenceFunctionType(CostInferenceForRowWiseSparseAdagrad));
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 SHOULD_NOT_DO_GRADIENT(Adagrad);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 SHOULD_NOT_DO_GRADIENT(SparseAdagrad);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 SHOULD_NOT_DO_GRADIENT(RowWiseSparseAdagrad);
 } // namespace caffe2

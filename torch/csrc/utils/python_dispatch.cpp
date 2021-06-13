@@ -3,6 +3,7 @@
 
 #include <torch/library.h>
 #include <ATen/ATen.h>
+#include <ATen/core/dispatch/Dispatcher.h>
 
 #include <pybind11/operators.h>
 
@@ -27,10 +28,14 @@ torch::Library::Kind parseKind(const std::string& k) {
 
 c10::optional<c10::DispatchKey> parseDispatchKey(const std::string& k) {
   static std::unordered_map<std::string, c10::DispatchKey> key_map = {
-    {"cpu", c10::DispatchKey::CPU},
-    {"cuda", c10::DispatchKey::CUDA},
-    {"xla", c10::DispatchKey::XLA},
-    {"autogradcpu", c10::DispatchKey::AutogradCPU},
+    {"CPU", c10::DispatchKey::CPU},
+    {"CUDA", c10::DispatchKey::CUDA},
+    {"XLA", c10::DispatchKey::XLA},
+    {"QuantizedCPU", c10::DispatchKey::QuantizedCPU},
+    {"CompositeImplicitAutograd", c10::DispatchKey::CompositeImplicitAutograd},
+    {"Autograd", c10::DispatchKey::Autograd},
+    {"CompositeExplicitAutograd", c10::DispatchKey::CompositeExplicitAutograd},
+    {"AutogradCPU", c10::DispatchKey::AutogradCPU},
     {"", c10::DispatchKey::Undefined},
   };
   auto it = key_map.find(k);
@@ -156,6 +161,15 @@ void initDispatchBindings(PyObject* module) {
       return "";
     } else {
       return op->dumpState();
+    }
+  });
+
+  m.def("_dispatch_dump_table", [](const char* name) -> std::string {
+    auto op = c10::Dispatcher::singleton().findOp(torch::jit::parseName(name));
+    if (!op) {
+      return "";
+    } else {
+      return op->dumpComputedTable();
     }
   });
 

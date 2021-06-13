@@ -1,7 +1,7 @@
 torch
 =====
 The torch package contains data structures for multi-dimensional
-tensors and mathematical operations over these are defined.
+tensors and defines mathematical operations over these tensors.
 Additionally, it provides many utilities for efficient serializing of
 Tensors and arbitrary types, and other useful utilities.
 
@@ -19,6 +19,7 @@ Tensors
     is_tensor
     is_storage
     is_complex
+    is_conj
     is_floating_point
     is_nonzero
     set_default_dtype
@@ -31,7 +32,7 @@ Tensors
 .. _tensor-creation-ops:
 
 Creation Ops
-~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~
 
 .. note::
     Random sampling creation ops are listed under :ref:`random-sampling` and
@@ -77,6 +78,8 @@ Creation Ops
     polar
     heaviside
 
+.. _indexing-slicing-joining:
+
 Indexing, Slicing, Joining, Mutating Ops
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. autosummary::
@@ -84,24 +87,38 @@ Indexing, Slicing, Joining, Mutating Ops
     :nosignatures:
 
     cat
+    conj
     chunk
+    dsplit
+    column_stack
     dstack
     gather
+    hsplit
     hstack
     index_select
     masked_select
     movedim
+    moveaxis
     narrow
     nonzero
     reshape
+    row_stack
+    scatter
+    scatter_add
     split
     squeeze
     stack
+    swapaxes
+    swapdims
     t
     take
+    take_along_dim
+    tensor_split
+    tile
     transpose
     unbind
     unsqueeze
+    vsplit
     vstack
     where
 
@@ -238,6 +255,9 @@ Examples::
     no_grad
     enable_grad
     set_grad_enabled
+    is_grad_enabled
+    inference_mode
+    is_inference_mode_enabled
 
 Math operations
 ---------------
@@ -275,23 +295,32 @@ Pointwise Ops
     ceil
     clamp
     clip
-    conj
+    conj_physical
+    copysign
     cos
     cosh
     deg2rad
     div
+    divide
     digamma
     erf
     erfc
     erfinv
     exp
+    exp2
     expm1
+    fake_quantize_per_channel_affine
+    fake_quantize_per_tensor_affine
     fix
+    float_power
     floor
     floor_divide
     fmod
     frac
+    frexp
+    gradient
     imag
+    ldexp
     lerp
     lgamma
     log
@@ -306,12 +335,18 @@ Pointwise Ops
     logical_xor
     logit
     hypot
+    i0
+    igamma
+    igammac
     mul
+    multiply
     mvlgamma
+    nan_to_num
     neg
     negative
     nextafter
     polygamma
+    positive
     pow
     rad2deg
     real
@@ -321,8 +356,10 @@ Pointwise Ops
     rsqrt
     sigmoid
     sign
+    sgn
     signbit
     sin
+    sinc
     sinh
     sqrt
     square
@@ -332,6 +369,7 @@ Pointwise Ops
     tanh
     true_divide
     trunc
+    xlogy
 
 Reduction Ops
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -343,17 +381,21 @@ Reduction Ops
     argmin
     amax
     amin
+    all
+    any
     max
     min
     dist
     logsumexp
     mean
     median
+    nanmedian
     mode
     norm
     nansum
     prod
     quantile
+    nanquantile
     std
     std_mean
     sum
@@ -374,7 +416,9 @@ Comparison Ops
     eq
     equal
     ge
+    greater_equal
     gt
+    greater
     isclose
     isfinite
     isinf
@@ -384,12 +428,18 @@ Comparison Ops
     isreal
     kthvalue
     le
+    less_equal
     lt
+    less
     maximum
     minimum
+    fmax
+    fmin
     ne
+    not_equal
     sort
     topk
+    msort
 
 
 Spectral Ops
@@ -398,16 +448,13 @@ Spectral Ops
     :toctree: generated
     :nosignatures:
 
-    fft
-    ifft
-    rfft
-    irfft
     stft
     istft
     bartlett_window
     blackman_window
     hamming_window
     hann_window
+    kaiser_window
 
 
 Other Operations
@@ -423,6 +470,8 @@ Other Operations
     bincount
     block_diag
     broadcast_tensors
+    broadcast_to
+    broadcast_shapes
     bucketize
     cartesian_prod
     cdist
@@ -437,17 +486,20 @@ Other Operations
     diag_embed
     diagflat
     diagonal
+    diff
     einsum
     flatten
     flip
     fliplr
     flipud
+    kron
     rot90
     gcd
     histc
     meshgrid
     lcm
     logcumsumexp
+    ravel
     renorm
     repeat_interleave
     roll
@@ -461,6 +513,7 @@ Other Operations
     vander
     view_as_real
     view_as_complex
+    resolve_conj
 
 
 BLAS and LAPACK Operations
@@ -483,6 +536,7 @@ BLAS and LAPACK Operations
     eig
     geqrf
     ger
+    inner
     inverse
     det
     logdet
@@ -522,5 +576,9 @@ Utilities
     result_type
     can_cast
     promote_types
-    set_deterministic
-    is_deterministic
+    use_deterministic_algorithms
+    are_deterministic_algorithms_enabled
+    set_warn_always
+    is_warn_always_enabled
+    vmap
+    _assert

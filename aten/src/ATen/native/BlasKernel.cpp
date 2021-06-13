@@ -191,12 +191,16 @@ void gemv(char trans, int64_t m, int64_t n, scalar_t alpha, scalar_t *a, int64_t
       }
     }
   } else {
-    if (beta != scalar_t(1)) scal<scalar_t>(m, beta, y, incy);
+    if (beta != scalar_t(1) && beta != scalar_t(0)) scal<scalar_t>(m, beta, y, incy);
 
     for (int64_t j = 0; j < n; j++) {
       scalar_t *column_ = a + lda * j;
       scalar_t z = alpha * x[j * incx];
       for (int64_t i = 0; i < m; i++) {
+        //output values are ignored if beta is 0, and set to 0, nans and infs are not propagated
+        if (j==0 && beta==scalar_t(0)) {
+         y[i * incy] = scalar_t(0);
+        }
         y[i * incy] += z * column_[i];
       }
     }
@@ -213,6 +217,7 @@ AT_FORALL_COMPLEX_TYPES(INSTANTIATE);
 namespace blas_impl {
 #if AT_BUILD_WITH_BLAS()
 float dot_fast_path(int n, float* x, int incx, float* y, int incy) {
+  // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
   return sdot_(&n, x, &incx, y, &incy);
 }
 
@@ -253,6 +258,7 @@ scalar_t dot_naive(
     scalar_t* y,
     int64_t incy,
     Functor op) {
+  // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   int64_t i;
   scalar_t sum = 0;
   for (i = 0; i < n; i++) {

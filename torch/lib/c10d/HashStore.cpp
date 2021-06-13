@@ -8,12 +8,35 @@
 #include <cstdio>
 #include <system_error>
 
+#include <c10/util/Exception.h>
+
 namespace c10d {
 
 void HashStore::set(const std::string& key, const std::vector<uint8_t>& data) {
   std::unique_lock<std::mutex> lock(m_);
   map_[key] = data;
   cv_.notify_all();
+}
+
+std::vector<uint8_t> HashStore::compareSet(
+    const std::string& key,
+    const std::vector<uint8_t>& expectedValue,
+    const std::vector<uint8_t>& desiredValue) {
+  std::unique_lock<std::mutex> lock(m_);
+  auto it = map_.find(key);
+  if ((it == map_.end() && expectedValue.empty()) ||
+      (it != map_.end() && it->second == expectedValue)) {
+    // if the key does not exist and currentValue arg is empty or
+    // the key does exist and current value is what is expected, then set it
+    map_[key] = desiredValue;
+    cv_.notify_all();
+    return desiredValue;
+  } else if (it == map_.end()) {
+    // if the key does not exist
+    return expectedValue;
+  }
+  // key exists but current value is not expected
+  return it->second;
 }
 
 std::vector<uint8_t> HashStore::get(const std::string& key) {
@@ -75,6 +98,17 @@ int64_t HashStore::add(const std::string& key, int64_t i) {
   const uint8_t* strB = reinterpret_cast<const uint8_t*>(str.c_str());
   map_[key] = std::vector<uint8_t>(strB, strB + str.size());
   return ti;
+}
+
+int64_t HashStore::getNumKeys() {
+  std::unique_lock<std::mutex> lock(m_);
+  return map_.size();
+}
+
+bool HashStore::deleteKey(const std::string& key) {
+  std::unique_lock<std::mutex> lock(m_);
+  auto numDeleted = map_.erase(key);
+  return (numDeleted == 1);
 }
 
 bool HashStore::check(const std::vector<std::string>& keys) {

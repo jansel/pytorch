@@ -39,11 +39,13 @@ std::string getAtenOpPattern(
     for (const auto& extra_arg : _extra_op_args) {
       aten_op_pattern += R"(
           )" +
+          // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
           extra_arg + "_scalar = aten::item(" + extra_arg + ")";
     }
 
-    for (size_t i = 0; i < _extra_op_args.size(); ++i) {
-      _extra_op_args[i] = _extra_op_args[i] + "_scalar";
+    for (auto& _extra_op_arg : _extra_op_args) {
+      // NOLINTNEXTLINE(performance-inefficient-string-concatenation)
+      _extra_op_arg = _extra_op_arg + "_scalar";
     }
   }
   const auto& extra_op_arg_list = getExtraArgList(_extra_op_args);
@@ -170,6 +172,7 @@ QuantFusionInfo getClampOpFusionInfo(
           %r = )";
   std::vector<std::string> scalar_extra_args;
   for (const auto& arg : extra_op_args) {
+    // NOLINTNEXTLINE(performance-inefficient-vector-operation)
     scalar_extra_args.push_back(arg + "_scalar");
   }
   op_pattern +=
@@ -405,6 +408,38 @@ graph(%a_quant, %packed_params, %r_scale, %r_zero_point, %r_dtype, %stride, %pad
   std::string quantized_conv3d_relu = R"(
 graph(%a_quant, %packed_params, %r_scale, %r_zero_point, %r_dtype, %stride, %padding, %dilation, %groups):
         %r_quant = quantized::conv3d_relu(%a_quant, %packed_params, %r_scale, %r_zero_point)
+        return (%r_quant) )";
+
+  // aten::conv_transpose1d
+  std::string conv_transpose1d = R"(
+graph(%a_quant, %packed_params, %r_scale, %r_zero_point, %r_dtype, %stride, %padding, %output_padding, %groups, %dilation):
+        %a_dequant = aten::dequantize(%a_quant)
+        %w_quant : Tensor, %b : Tensor? = quantized::conv_transpose1d_unpack(%packed_params)
+        %w_dequant = aten::dequantize(%w_quant)
+        %r = aten::conv_transpose1d(%a_dequant, %w_dequant, %b, %stride, %padding, %output_padding, %groups, %dilation)
+        %r_quant = aten::quantize_per_tensor(%r, %r_scale, %r_zero_point, %r_dtype)
+        return (%r_quant) )";
+
+  // quantized::conv_transpose1d
+  std::string quantized_conv_transpose1d = R"(
+graph(%a_quant, %packed_params, %r_scale, %r_zero_point, %r_dtype, %stride, %padding, %output_padding, %groups, %dilation):
+        %r_quant = quantized::conv_transpose1d(%a_quant, %packed_params, %r_scale, %r_zero_point)
+        return (%r_quant) )";
+
+  // aten::conv_transpose2d
+  std::string conv_transpose2d = R"(
+graph(%a_quant, %packed_params, %r_scale, %r_zero_point, %r_dtype, %stride, %padding, %output_padding, %groups, %dilation):
+        %a_dequant = aten::dequantize(%a_quant)
+        %w_quant : Tensor, %b : Tensor? = quantized::conv_transpose2d_unpack(%packed_params)
+        %w_dequant = aten::dequantize(%w_quant)
+        %r = aten::conv_transpose2d(%a_dequant, %w_dequant, %b, %stride, %padding, %output_padding, %groups, %dilation)
+        %r_quant = aten::quantize_per_tensor(%r, %r_scale, %r_zero_point, %r_dtype)
+        return (%r_quant) )";
+
+  // quantized::conv_transpose1d
+  std::string quantized_conv_transpose2d = R"(
+graph(%a_quant, %packed_params, %r_scale, %r_zero_point, %r_dtype, %stride, %padding, %output_padding, %groups, %dilation):
+        %r_quant = quantized::conv_transpose2d(%a_quant, %packed_params, %r_scale, %r_zero_point)
         return (%r_quant) )";
 
   std::string add_relu = R"(
@@ -907,6 +942,12 @@ graph(%a_quant, %alpha, %scale, %input_scale, %r_scale, %r_zero_point, %r_dtype)
       {"quantized::conv3d", conv3d, quantized_conv3d},
       {"quantized::conv3d_relu", conv3d_relu, quantized_conv3d_relu},
       {"quantized::conv3d_relu", conv3d_inplace_relu, quantized_conv3d_relu},
+      {"quantized::conv_transpose1d",
+       conv_transpose1d,
+       quantized_conv_transpose1d},
+      {"quantized::conv_transpose2d",
+       conv_transpose2d,
+       quantized_conv_transpose2d},
       {"quantized::linear", linear, quantized_linear},
       {"quantized::linear_relu", linear_relu, quantized_linear_relu},
       {"quantized::linear_relu", linear_inplace_relu, quantized_linear_relu},
@@ -1128,12 +1169,44 @@ graph(%a_dequant, %w_quant, %b, %stride, %padding, %dilation, %groups):
         %r = aten::conv3d(%a_dequant, %w_dequant, %b_unpacked, %stride, %padding, %dilation, %groups)
         return (%r) )";
 
+  std::string conv_transpose1d_with_quant = R"(
+graph(%a_dequant, %w_quant, %b, %stride, %padding, %output_padding, %groups, %dilation):
+        %w_dequant = aten::dequantize(%w_quant)
+        %r = aten::conv_transpose1d(%a_dequant, %w_dequant, %b, %stride, %padding, %output_padding, %groups, %dilation)
+        return (%r) )";
+
+  std::string conv_transpose1d_with_quant_prepack = R"(
+graph(%a_dequant, %w_quant, %b, %stride, %padding, %output_padding, %groups, %dilation):
+        %packed_params : __torch__.torch.classes.quantized.Conv2dPackedParamsBase = quantized::conv_transpose1d_prepack(%w_quant, %b, %stride, %padding, %output_padding, %dilation, %groups)
+        %w_quant_unpacked : Tensor, %b_unpacked : Tensor? = quantized::conv_transpose1d_unpack(%packed_params)
+        %w_dequant = aten::dequantize(%w_quant_unpacked)
+        %r = aten::conv_transpose1d(%a_dequant, %w_dequant, %b_unpacked, %stride, %padding, %output_padding, %groups, %dilation)
+        return (%r) )";
+
+  std::string conv_transpose2d_with_quant = R"(
+graph(%a_dequant, %w_quant, %b, %stride, %padding, %output_padding, %groups, %dilation):
+        %w_dequant = aten::dequantize(%w_quant)
+        %r = aten::conv_transpose2d(%a_dequant, %w_dequant, %b, %stride, %padding, %output_padding, %groups, %dilation)
+        return (%r) )";
+
+  std::string conv_transpose2d_with_quant_prepack = R"(
+graph(%a_dequant, %w_quant, %b, %stride, %padding, %output_padding, %groups, %dilation):
+        %packed_params : __torch__.torch.classes.quantized.Conv2dPackedParamsBase = quantized::conv_transpose2d_prepack(%w_quant, %b, %stride, %padding, %output_padding, %dilation, %groups)
+        %w_quant_unpacked : Tensor, %b_unpacked : Tensor? = quantized::conv_transpose2d_unpack(%packed_params)
+        %w_dequant = aten::dequantize(%w_quant_unpacked)
+        %r = aten::conv_transpose2d(%a_dequant, %w_dequant, %b_unpacked, %stride, %padding, %output_padding, %groups, %dilation)
+        return (%r) )";
+
   return {
       {"conv1d_prepack_unpack", conv1d_with_quant, conv1d_with_quant_prepack},
       {"conv2d_prepack_unpack", conv2d_with_quant, conv2d_with_quant_prepack},
-      {"conv3d_prepack_unpack", conv3d_with_quant, conv3d_with_quant_prepack}
-
-  };
+      {"conv3d_prepack_unpack", conv3d_with_quant, conv3d_with_quant_prepack},
+      {"conv_transpose1d_prepack_unpack",
+       conv_transpose1d_with_quant,
+       conv_transpose1d_with_quant_prepack},
+      {"conv_transpose2d_prepack_unpack",
+       conv_transpose2d_with_quant,
+       conv_transpose2d_with_quant_prepack}};
 }
 
 } // namespace jit

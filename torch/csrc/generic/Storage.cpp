@@ -2,6 +2,7 @@
 #define TH_GENERIC_FILE "torch/csrc/generic/Storage.cpp"
 #else
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 PyObject *THPStorageClass = nullptr;
 
 PyObject * THPStorage_(New)(THWStorage *ptr)
@@ -148,26 +149,23 @@ static PyObject * THPStorage_(get)(THPStorage *self, PyObject *index)
     if (nindex < 0)
       nindex += (self->cdata->nbytes() / sizeof(scalar_t));
     if (nindex < 0 || nindex >= (self->cdata->nbytes() / sizeof(scalar_t))) {
-      PyErr_Format(
-          PyExc_IndexError,
-          "index %" PRId64
-          " out of range for storage of "
-          "size %" PRId64,
-          (int64_t)nindex,
-          (int64_t)(self->cdata->nbytes() / sizeof(scalar_t)));
+      PyErr_SetString(PyExc_IndexError, fmt::format(
+            "index {} out of range for storage of size {}",
+            nindex, self->cdata->nbytes() / sizeof(scalar_t)));
       return nullptr;
     }
     scalar_t value = THWStorage_(get)(LIBRARY_STATE self->cdata, nindex);
     return THPUtils_(newReal)(value);
   /* Slice index */
   } else if (PySlice_Check(index)) {
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     Py_ssize_t start, stop, slicelength, step;
     int64_t len = self->cdata->nbytes() / sizeof(scalar_t);
     if (!THPUtils_parseSlice(index, len, &start, &stop, &step, &slicelength))
       return nullptr;
     if (step != 1) {
-      THPUtils_setError("Trying to slice with a step of %" PRId64 ", but only a step of "
-          "1 is supported", (int64_t)step);
+      THPUtils_setError("Trying to slice with a step of %lld, but only a step of "
+          "1 is supported", (long long)step);
       return nullptr;
     }
 
@@ -217,13 +215,14 @@ static int THPStorage_(set)(THPStorage *self, PyObject *index, PyObject *value)
     THWStorage_(set)(LIBRARY_STATE self->cdata, nindex, rvalue);
     return 0;
   } else if (PySlice_Check(index)) {
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     Py_ssize_t start, stop, slicelength, step;
     int64_t len = self->cdata->nbytes() / sizeof(scalar_t);
     if (!THPUtils_parseSlice(index, len, &start, &stop, &step, &slicelength))
       return -1;
     if (step != 1) {
-      THPUtils_setError("Trying to slice with a step of %" PRId64 ", but only a step of "
-          "1 is supported", (int64_t)step);
+      THPUtils_setError("Trying to slice with a step of %lld, but only a step of "
+          "1 is supported", (long long)step);
       return 0;
     }
     // TODO: check the bounds only once
@@ -238,6 +237,7 @@ static int THPStorage_(set)(THPStorage *self, PyObject *index, PyObject *value)
   END_HANDLE_TH_ERRORS_RET(-1)
 }
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static PyMappingMethods THPStorage_(mappingmethods) = {
   (lenfunc)THPStorage_(length),
   (binaryfunc)THPStorage_(get),
@@ -245,12 +245,14 @@ static PyMappingMethods THPStorage_(mappingmethods) = {
 };
 
 // TODO: implement equality
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 PyTypeObject THPStorageType = {
   PyVarObject_HEAD_INIT(nullptr, 0)
   "torch._C." THPStorageBaseStr,               /* tp_name */
   sizeof(THPStorage),                          /* tp_basicsize */
   0,                                           /* tp_itemsize */
   (destructor)THPStorage_(dealloc),            /* tp_dealloc */
+  // NOLINTNEXTLINE(modernize-use-nullptr)
   0,                                           /* tp_vectorcall_offset */
   nullptr,                                     /* tp_getattr */
   nullptr,                                     /* tp_setattr */
@@ -286,6 +288,7 @@ PyTypeObject THPStorageType = {
   THPStorage_(pynew),                          /* tp_new */
 };
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
 static struct PyMemberDef THPStorage_(members)[] = {
   {(char*)"_cdata", T_ULONGLONG, offsetof(THPStorage, cdata), READONLY, nullptr},
   {nullptr}
@@ -313,13 +316,16 @@ static PyObject * THPStorage_(dtype)(THPStorage *self, void *unused)
 
 typedef PyObject *(*getter)(PyObject *, void *);
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-avoid-non-const-global-variables)
 static struct PyGetSetDef THPStorage_(properties)[] = {
   {"device", (getter)THPStorage_(device), nullptr, nullptr, nullptr},
   {"dtype",  (getter)THPStorage_(dtype), nullptr, nullptr, nullptr},
   {nullptr}
 };
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 extern THPCopyList THWStorage_(copy_functions);
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 THPCopyList THWStorage_(copy_functions);
 
 void THPStorage_(initCopyMethods)()
@@ -395,7 +401,9 @@ void THPStorage_(initCopyMethods)()
 #endif
 }
 
+// NOLINTNEXTLINE(bugprone-suspicious-include)
 #include <torch/csrc/generic/StorageMethods.cpp>
+// NOLINTNEXTLINE(bugprone-suspicious-include)
 #include <torch/csrc/generic/StorageSharing.cpp>
 
 bool THPStorage_(init)(PyObject *module)

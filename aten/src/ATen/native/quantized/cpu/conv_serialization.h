@@ -41,21 +41,6 @@
  *    to make ONNX happy (ints and containers of ints are not supported).
  */
 
-// version 1
-using ConvParamsSerializationTypeLegacy = std::tuple<
-  // weight
-  at::Tensor,
-  // bias
-  c10::optional<at::Tensor>,
-  // stride x kSpatialDim
-  torch::List<at::Tensor>,
-  // padding x kSpatialDim
-  torch::List<at::Tensor>,
-  // dilation x kSpatialDim
-  torch::List<at::Tensor>,
-  // groups
-  at::Tensor>;
-
 // version 2
 using ConvParamsSerializationType = std::tuple<
   // version, for versions 2 and up
@@ -108,6 +93,7 @@ ConvParamsSerializationType parse_conv_serialized_state(c10::IValue v) {
 
     std::vector<int16_t> params_vec;
     params_vec.push_back(kSpatialDim);
+    // NOLINTNEXTLINE(clang-diagnostic-sign-compare)
     for (int i = 0; i < stride_x_kSpatialDim.size(); i++) {
       auto stride = stride_x_kSpatialDim.get(i);
       params_vec.push_back(stride[0].item<int16_t>());
@@ -140,7 +126,22 @@ ConvParamsSerializationType parse_conv_serialized_state(c10::IValue v) {
     return std::tie(version, non_optional, optional);
   } else if (version == 2) {
     // version 2
-    return v.to<ConvParamsSerializationType>();
+    auto elements = v.toTuple()->elements();
+    std::vector<at::Tensor> non_optional = elements[1].toTensorList().vec();
+    std::vector<c10::optional<at::Tensor>> optional;
+
+    if (elements[2].isTensorList()) {
+      for (const auto& elem : elements[2].toTensorList()) {
+        optional.emplace_back(static_cast<at::Tensor>(elem));
+      }
+    } else {
+      for (const auto& elem : elements[2].toList()) {
+        optional.emplace_back(static_cast<c10::IValue>(elem).toOptional<at::Tensor>());
+      }
+    }
+
+    std::string version = "2";
+    return std::tie(version, non_optional, optional);
   } else {
     TORCH_INTERNAL_ASSERT(false, "Unexpected serialized qconv version: ",
         version);
@@ -167,9 +168,6 @@ ConvParamsSerializationType serialize_conv(
   auto output_padding = params->output_padding().vec();
   params_vec.insert(params_vec.end(), output_padding.begin(),
                     output_padding.end());
-  for (int i = 0; i < kSpatialDim; i++) {
-    params_vec.push_back(0);
-  }
   params_vec.push_back(params->groups());
   params_vec.push_back(params->transpose());
   int64_t vec_size = params_vec.size();
@@ -191,35 +189,6 @@ ConvParamsSerializationType serialize_conv(
 }
 
 template <uint32_t kSpatialDim>
-ConvParamsSerializationTypeLegacy serialize_conv_legacy(
-    const c10::intrusive_ptr<ConvPackedParamsBase<kSpatialDim>>& params) {
-      at::Tensor weight;
-      c10::optional<at::Tensor> bias;
-      std::tie(weight, bias) = params->unpack();
-      torch::List<at::Tensor> stride;
-      torch::List<at::Tensor> padding;
-      torch::List<at::Tensor> dilation;
-      at::Tensor groups;
-      for (int64_t s : params->stride()) {
-        stride.emplace_back(at::tensor(s));
-      }
-      for (int64_t p : params->padding()) {
-        padding.emplace_back(at::tensor(p));
-      }
-      for (int64_t d : params->dilation()) {
-        dilation.emplace_back(at::tensor(d));
-      }
-      groups = at::tensor(params->groups());
-      return std::make_tuple(
-          std::move(weight),
-          std::move(bias),
-          stride,
-          padding,
-          dilation,
-          groups);
-}
-
-template <uint32_t kSpatialDim>
 c10::intrusive_ptr<ConvPackedParamsBase<kSpatialDim>> deserialize_conv(
     ConvParamsSerializationType state) {
 
@@ -238,6 +207,7 @@ c10::intrusive_ptr<ConvPackedParamsBase<kSpatialDim>> deserialize_conv(
   torch::List<int64_t> stride, padding, output_padding, dilation;
   // skip kSpatialDim
   int idx = 1;
+  // NOLINTNEXTLINE(clang-diagnostic-sign-compare)
   for (int i = 0; i < kSpatialDim; ++i) {
     stride.emplace_back(conv_params_packed[idx].item<int64_t>());
     idx++;
