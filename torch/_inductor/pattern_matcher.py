@@ -503,7 +503,7 @@ class LoweringPatternEntry(PatternEntry):
 
     def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node):
         handler = functools.wraps(self.handler)(functools.partial(self.handler, match))
-        with graph.inserting_before(node):
+        with graph.inserting_after(node):
             replacement = graph.call_function(handler, tuple(match.args), match.kwargs)
             replacement.meta.update(node.meta)
             node.replace_all_uses_with(replacement)
@@ -520,7 +520,7 @@ class GraphPatternEntry(PatternEntry):
     handler: Any
 
     def apply(self, match: Match, graph: torch.fx.Graph, node: torch.fx.Node):
-        with graph.inserting_before(node):
+        with graph.inserting_after(node):
             self.handler(match, *match.args, **match.kwargs)
 
 
@@ -555,7 +555,7 @@ class ReplacementPatternEntry(PatternEntry):
         output_nodes = match.output_nodes()
         node = output_nodes[0]
 
-        with graph.inserting_before(node):
+        with graph.inserting_after(node):
             replacement = Replacer(replacement_graph).run(*args)
             if isinstance(replacement, torch.fx.Node):
                 replacement = [replacement]
@@ -835,6 +835,35 @@ def training_graph(fn, args):
     gm.graph.eliminate_dead_code()
     gm.recompile()
     return gm
+
+
+def _args(n: torch.fx.Node):
+    args = list()
+    torch.fx.map_arg((n.args, n.kwargs), args.append)
+    return args
+
+
+def stable_topological_sort(graph: torch.fx.Graph):
+    waiting = defaultdict(list)
+    ready = set()
+    cursor = None
+
+    def check(node):
+        waiting_for = [x for x in _args(node) if x not in ready]
+        if waiting_for:
+            # revisit this node when next input is ready
+            waiting[waiting_for[0]].append(node)
+        else:
+            nonlocal cursor
+            cursor = node
+            ready.add(node)
+            for other in waiting.pop(node, ()):
+                cursor.append(other)
+                check(other)
+
+    for n in list(graph.nodes):
+        check(n)
+    assert not waiting and len(ready) == len(graph.nodes)
 
 
 def init_once_fakemode(fn):

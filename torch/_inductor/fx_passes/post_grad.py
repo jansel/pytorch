@@ -21,6 +21,7 @@ from ..pattern_matcher import (
     Match,
     MULTIPLE,
     PatternMatcherPass,
+    stable_topological_sort,
 )
 from ..virtualized import V
 
@@ -57,6 +58,7 @@ def post_grad_passes(gm: torch.fx.GraphModule):
         for patterns in pass_patterns:
             patterns.apply(gm.graph)
 
+    stable_topological_sort(gm.graph)
     gm.graph.lint()
 
 

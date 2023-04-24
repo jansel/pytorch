@@ -10,7 +10,9 @@ from ..pattern_matcher import (
     Match,
     PatternMatcherPass,
     register_graph_pattern,
+    stable_topological_sort,
 )
+from .replace_random import replace_random_passes
 
 log = logging.getLogger(__name__)
 patterns = PatternMatcherPass()
@@ -27,14 +29,17 @@ def joint_graph_passes(graph: torch.fx.GraphModule):
     """
     Run FX transformations on the joint forwards+backwards graph.
     """
-    if not config.pattern_matcher:
-        return
-
     lazy_init()
+    count = 0
 
-    count = patterns.apply(graph.graph)
+    if config.pattern_matcher:
+        count += patterns.apply(graph.graph)
+
+    if not config.fallback_random:
+        count += replace_random_passes(graph)
 
     if count:
+        stable_topological_sort(graph.graph)
         graph.graph.lint()
         graph.recompile()
     return graph
