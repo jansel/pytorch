@@ -3,10 +3,11 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import itertools
 import os
 import re
 from itertools import count
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import sympy
 from sympy import Expr
@@ -234,6 +235,71 @@ class ReuseLine(MemoryPlanningLine):
         )
 
 
+@dataclasses.dataclass
+class PoolMeta:
+    device: torch.device
+    name: str
+    parent: Optional["PoolMeta"] = None
+    buffer_names: Set[str] = dataclasses.field(default_factory=set)
+    conflicting_names: Set[str] = dataclasses.field(default_factory=set)
+    create_line_added = False
+
+    def add_create_line(self):
+        assert not self.create_line_added
+        self.create_line_added = True
+        return CreatePoolLine(self)
+
+    def root_pool(self):
+        rv = self
+        while rv.parent:
+            rv = rv.parent
+        return rv
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+
+@dataclasses.dataclass
+class CreatePoolLine(MemoryPlanningLine):
+    pool: PoolMeta
+
+
+@dataclasses.dataclass
+class ReleasePoolLine(MemoryPlanningLine):
+    pool: PoolMeta
+
+
+@dataclasses.dataclass
+class PoolAllocLine(MemoryPlanningLine):
+    pool: PoolMeta
+    node: ir.Buffer
+    conflicting_names: Set[str] = dataclasses.field(default_factory=set)
+
+    @property
+    def alloc_name(self):
+        return self.node.get_name()
+
+    def codegen(self, code: IndentedBuffer):
+        code.writeline(f"{self.alloc_name} = {self.pool.name}.alloc({TODO})")
+
+
+@dataclasses.dataclass
+class PoolDeallocLine(MemoryPlanningLine):
+    pool: PoolMeta
+    names: List[str]
+
+    @property
+    def alloc_name(self):
+        return self.names[0]
+
+    def codegen(self, code: IndentedBuffer):
+        code.writeline(f"{self.pool.name}.dealloc({self.alloc_name})")
+        code.writeline(f"del {', '.join(self.names)}")
+
+
 class NullLine(MemoryPlanningLine):
     pass
 
@@ -436,20 +502,7 @@ class WrapperCodeGen(CodeGen):
                 self.write_triton_header_once()
                 self.wrapper_call.writeline("start_graph()")
 
-            while (
-                self.lines
-                and isinstance(self.lines[-1], MemoryPlanningLine)
-                # TODO: this seems legit, NullLine has no node
-                and self.lines[-1].node.name not in out_names  # type: ignore[attr-defined]
-            ):
-                # these lines will be pointless
-                self.lines.pop()
-
-            # codegen allocations in two passes
-            planning_state = MemoryPlanningState()
-            for i in range(len(self.lines)):
-                if isinstance(self.lines[i], MemoryPlanningLine):
-                    self.lines[i] = self.lines[i].plan(planning_state)
+            self.memory_plan()
 
             device_cm_stack = contextlib.ExitStack()
             for line in self.lines:
@@ -487,6 +540,207 @@ class WrapperCodeGen(CodeGen):
         self.add_benchmark_harness(result)
 
         return result.getvaluewithlinemap()
+
+    def memory_plan(self):
+        self.memory_plan_stack()
+
+    def memory_plan_reuse(self):
+        while (
+            self.lines
+            and isinstance(self.lines[-1], MemoryPlanningLine)
+            # TODO: this seems legit, NullLine has no node
+            and self.lines[-1].node.name not in out_names  # type: ignore[attr-defined]
+        ):
+            # these lines will be pointless
+            self.lines.pop()
+
+        # codegen allocations in two passes
+        planning_state = MemoryPlanningState()
+        for i in range(len(self.lines)):
+            if isinstance(self.lines[i], MemoryPlanningLine):
+                self.lines[i] = self.lines[i].plan(planning_state)
+
+    def memory_plan_stack(self):
+        # drop any removed buffers
+        for i, line in enumerate(self.lines):
+            if isinstance(line, (AllocateLine, FreeIfNotReusedLine)):
+                if line.node.get_name() in V.graph.removed_buffers:
+                    self.lines[i] = NullLine(self)
+
+        # get groups of buffers created by ReuseLine
+        buffer_groups = {}
+        for line in self.lines:
+            if isinstance(line, AllocateLine):
+                name = line.node.get_name()
+                assert name not in buffer_groups
+                buffer_groups[name] = [name]
+            elif isinstance(line, ReuseLine):
+                old_name = line.node.get_name()
+                new_name = line.reused_as.get_name()
+                assert new_name not in buffer_groups
+                buffer_groups[old_name].append(new_name)
+                buffer_groups[new_name] = buffer_groups[old_name]
+        buffer_groups = [*{id(g): g for g in buffer_groups.values()}.values()]
+
+        # don't apply memory planning to inputs and outputs
+        input_output = {x.get_name() for x in V.graph.graph_outputs}
+        input_output |= V.graph.graph_inputs.keys()
+        buffer_groups = [
+            g for g in buffer_groups if all(x not in input_output for x in g)
+        ]
+
+        # convert lines to PoolAllocLine/PoolDeallocLine
+        to_be_freed = set()
+        name_to_group = {}
+        for group in buffer_groups:
+            to_be_freed.add(group[0])
+            for name in group:
+                name_to_group[name] = group
+        pools = {}
+        for i, line in enumerate(self.lines):
+            if isinstance(line, AllocateLine):
+                if line.node.get_name() in name_to_group:
+                    if line.node.get_device() not in pools:
+                        pools[line.node.get_device()] = PoolMeta(
+                            line.node.get_device(), f"stack{len(pools)}"
+                        )
+                    self.lines[i] = PoolAllocLine(
+                        self, pools[line.node.get_device()], line.node
+                    )
+            elif isinstance(line, FreeIfNotReusedLine):
+                assert not line.is_reused, "not used"
+                if line.node.get_name() in name_to_group:
+                    group = name_to_group[line.node.get_name()]
+                    self.lines[i] = PoolDeallocLine(
+                        self, pools[line.node.get_device()], group
+                    )
+                    to_be_freed.remove(group[0])
+        assert not to_be_freed, f"expected free of: {to_be_freed!r}"
+
+        # TODO(jansel): pass to reorder spans of creations/reuse ops by last use
+
+        # reorder to get stack ordering
+        new_lines = []
+        stack: List[PoolAllocLine] = []
+        worklist = [*reversed(self.lines)]
+        while worklist:
+            line = worklist.pop()
+            if isinstance(line, PoolAllocLine):
+                stack.append(line)
+                new_lines.append(line)
+            elif isinstance(line, PoolDeallocLine):
+                pending_lines = {line.alloc_name: line}
+                # group any further deallocs together
+                while worklist and isinstance(worklist[-1], PoolAllocLine):
+                    line = worklist.pop()
+                    pending_lines[line.alloc_name] = line
+
+                # handle any simple cases where we can use the main stack
+                while stack and stack[-1].alloc_name in pending_lines:
+                    new_lines.append(pending_lines.pop(stack.pop().alloc_name))
+
+                # mark conflicts and print remaining lines
+                conflicting_names = set()
+                for stack_item in reversed(stack):
+                    if stack_item.alloc_name in pending_lines:
+                        assert conflicting_names
+                        stack_item.conflicting_names.update(conflicting_names)
+                        new_lines.append(pending_lines.pop(stack_item.alloc_name))
+                    conflicting_names.add(stack_item.alloc_name)
+
+                assert not pending_lines
+            else:
+                new_lines.append(line)
+        assert not stack, f"nonempty: {stack}"
+        self.lines = new_lines
+
+        # assign pools to each allocation
+        # TODO(jansel): maybe a fixed list of pools would be enough?
+        pool_idx = collections.counter()
+        new_lines = []
+        pool_state = {p: [] for p in pools.values()}
+        alloc_lines = {}
+        for line in self.lines:
+            remove_pool = None
+            if isinstance(line, PoolAllocLine):
+                if not line.pool.create_line_added:
+                    new_lines.append(line.pool.add_create_line())
+
+                if line.conflicting_names:
+                    # need to assign this a sub-pool
+                    assigned = False
+                    for pool in pool_state.keys():
+                        if (
+                            not pool.parent
+                            and line.alloc_name not in pool.conflicting_names
+                            and len(pool.buffer_names & line.conflicting_names) == 0
+                        ):
+                            assigned = True
+                            pool.buffer_names.add(line.alloc_name)
+                            pool.conflicting_names.update(line.conflicting_names)
+                            line.pool = pool
+                            break
+                    if not assigned:
+                        # create new pool
+                        pool = PoolMeta(
+                            line.pool.device,
+                            f"subpool{next(pool_idx)}",
+                            parent=line.pool,
+                            buffer_names={line.alloc_name},
+                            conflicting_names=set(line.conflicting_names),
+                        )
+                        new_lines.append(pool.add_create_line())
+                        line.pool = pool
+                        pool_state[pool] = []
+                        pool_state[pool.parent].append(pool)
+
+                alloc_lines[line.alloc_name] = line
+                pool_state[line.pool].append(line)
+            elif isinstance(line, PoolDeallocLine):
+                alloc_line = alloc_lines.pop(line.alloc_name)
+                pool = alloc_line.pool
+                line.pool = pool
+                assert pool_state[pool][-1] is alloc_line
+                pool_state[pool].pop()
+
+                if (
+                    pool.parent
+                    and not pool_state[pool]
+                    and pool_state[pool.parent][-1] is pool
+                ):
+                    # this pool is empty and on top of parent stack, destroy it
+                    remove_pool = pool_state[pool.parent].pop()
+                elif (
+                    pool_state[pool]
+                    and isinstance(pool_state[pool][-1], PoolMeta)
+                    and pool_state[pool_state[pool][-1]]
+                ):
+                    # empty pool on top of stack, destroy it
+                    remove_pool = pool_state[pool].pop()
+
+            new_lines.append(line)
+            if remove_pool:
+                new_lines.append(ReleasePoolLine(remove_pool))
+                pool_state.pop(remove_pool)
+        assert not alloc_lines
+        assert len(pool_state) == len(pools)
+        self.lines = new_lines
+
+        # dallocate the root pools
+        need_to_dealloc = set(pools.values())
+        new_lines = []
+        for line in reversed(self.lines):
+            if need_to_dealloc and isinstance(line, (PoolDeallocLine, ReleasePoolLine)):
+                pool = line.pool.root_pool()
+                if pool in need_to_dealloc:
+                    need_to_dealloc.remove(pool)
+                    new_lines.append(ReleasePoolLine(pool))
+            new_lines.append(line)
+        self.lines = [*reversed(new_lines)]
+
+        # compute size of every pool
+
+        # TODO(jansel): recursive pools of pools of pools alloctor
 
     def codegen_inputs(self, code: IndentedBuffer, graph_inputs: Dict[str, ir.Buffer]):
         """Assign all symbolic shapes to locals"""
