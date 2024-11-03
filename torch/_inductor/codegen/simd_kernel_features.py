@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
+import functools
 import itertools
-from typing import Any, Dict, Iterable, List, Type, Union
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Type, Union
 
 import sympy
 
 import torch
 
 from ...utils._ordered_set import OrderedSet
+from ...utils._sympy.functions import FloorDiv, ModularIndexing
 from ..dependencies import Dep, MemoryDep
 from ..runtime.hints import ReductionHint
 from ..scheduler import SchedulerNode
-from ..utils import cache_on_self
+from ..utils import cache_on_self, sympy_subs
 from ..virtualized import V
 
 
@@ -184,3 +187,162 @@ class SIMDKernelFeatures:
             return ReductionHint.INNER
         else:
             return node.node.data.reduction_hint
+
+
+class MemoryEstimator:
+    """
+    Estimate various properties of the kernel for use in heuristics.
+    We simulate the memory effects of CSE/buffer elimination in codegen.
+    """
+
+    symbols: Tuple[sympy.Symbol, ...]
+    kernel_sizes: Tuple[sympy.Expr, ...]
+    node_index_vars: List[sympy.Expr]
+
+    def __init__(self, features: SIMDKernelFeatures, groups: Sequence[sympy.Expr]):
+        self.features = features
+        self.inside_reduction = features.is_reduction()
+        self.outside_loop = MemoryEstimate()
+        self.loops = [MemoryEstimate()]
+        self.persistent = MemoryEstimate()
+        self.store_buffer_names: OrderedSet[str] = OrderedSet()
+        self.must_keep_buffers: OrderedSet[str] = OrderedSet()
+        self.groups = groups
+
+        if len(groups) == 2:
+            self.symbols = (sympy.Symbol("x"), sympy.Symbol("r"))
+        elif len(groups) == 3:
+            self.symbols = (sympy.Symbol("x"), sympy.Symbol("y"), sympy.Symbol("r"))
+        else:
+            raise NotImplementedError(len(groups))
+
+        self.simulate_codegen()
+        self.remove_kernel_local()
+
+    def simulate_codegen(self) -> None:
+        from .simd import SIMDKernel
+
+        kernel_size_outside_loop = (*self.groups[:-1], sympy.S.One)
+        kernel_size_inside_loop = tuple(self.groups)
+        self.kernel_sizes = kernel_size_inside_loop
+
+        for node in self.features.node_schedule:
+            if node is DisableReduction:
+                self.inside_reduction = False
+                self.kernel_sizes = kernel_size_outside_loop
+                continue
+            elif node is EnableReduction:
+                self.inside_reduction = True
+                self.kernel_sizes = kernel_size_inside_loop
+                self.loops.append(MemoryEstimate())
+                continue
+            assert isinstance(node, SchedulerNode)
+            self.node_index_vars = [
+                *itertools.chain.from_iterable(
+                    SIMDKernel.map_kernel_groups_to_node_sizes(
+                        self.kernel_sizes, node.get_ranges(), self.set_ranges
+                    )
+                )
+            ]
+
+            for dep in node.read_writes.reads:
+                name, dep = self.process_dep(dep)
+                if not self.persistent.writes.get(name):  # cache miss?
+                    self.persistent.reads[name].add(dep)
+                if not (
+                    self.outside_loop.writes.get(name)
+                    or self.loops[-1].writes.get(name)
+                ):
+                    self.scope(dep).reads[name].add(dep)
+                    if name in self.store_buffer_names and self.loops[-1].reads.get(
+                        name
+                    ):
+                        self.must_keep_buffers.add(name)
+
+            for dep in node.read_writes.writes:
+                name, dep = self.process_dep(dep)
+                self.store_buffer_names.add(name)
+                self.persistent.writes[name].add(dep)
+                self.scope(dep).writes[name].add(dep)
+
+    def remove_kernel_local(self) -> None:
+        # Remove any kernel-local buffers
+        for name in self.store_buffer_names:
+            if not self.persistent.reads.get(
+                name
+            ) and V.graph.scheduler.can_buffer_be_removed_through_fusion(
+                name, self.store_buffer_names
+            ):
+                self.persistent.remove(name)
+                if name not in self.must_keep_buffers:
+                    # we can also remove this from the looped kernel
+                    self.outside_loop.remove(name)
+                    for loop in self.loops:
+                        loop.remove(name)
+
+        if not self.loops[-1]:
+            self.loops.pop()  # for pointwise ops
+
+    def scope(self, dep: MemoryDep) -> MemoryEstimate:
+        """Determine how a read/write should be categorized"""
+        if self.inside_reduction and (
+            self.symbols[-1] in dep.index.free_symbols or dep.is_indirect()
+        ):
+            return self.loops[-1]
+        return self.outside_loop
+
+    def set_ranges(self, *lengths: List[List[sympy.Expr]]) -> List[List[sympy.Expr]]:
+        assert len(self.kernel_sizes) == len(lengths)
+        return [
+            self.make_flat_range(sym, numel, length)
+            for sym, numel, length in zip(self.symbols, self.kernel_sizes, lengths)
+        ]
+
+    def process_dep(self, dep: Dep) -> Tuple[str, MemoryDep]:
+        assert isinstance(dep, MemoryDep)
+        assert len(dep.var_names) == len(self.node_index_vars)
+        index = sympy_subs(dep.index, dict(zip(dep.var_names, self.node_index_vars)))
+        index = V.graph.sizevars.simplify_with_ranges(
+            index, dict(zip(self.symbols, self.kernel_sizes))
+        )
+        return dep.name, MemoryDep(
+            name=dep.name,
+            index=index,
+            var_names=self.symbols,
+            size=self.kernel_sizes,
+            mode=dep.mode,
+        )
+
+    @staticmethod
+    def make_flat_range(
+        sym: sympy.Symbol, numel: sympy.Expr, lengths: List[sympy.Expr]
+    ) -> List[sympy.Expr]:
+        if len(lengths) == 1 and numel == lengths[0]:
+            return [sym]
+        divisor = sympy.S.One
+        itervars = []
+        for length in reversed(lengths):
+            if V.graph.sizevars.statically_known_equals(divisor * length, numel):
+                expr = FloorDiv(sym, divisor)
+            else:
+                expr = ModularIndexing(sym, divisor, length)
+            itervars.append(expr)
+            divisor = divisor * length
+        return [*reversed(itervars)]
+
+
+@dataclasses.dataclass
+class MemoryEstimate:
+    reads: Dict[str, OrderedSet[MemoryDep]] = dataclasses.field(
+        default_factory=functools.partial(collections.defaultdict, OrderedSet)
+    )
+    writes: Dict[str, OrderedSet[MemoryDep]] = dataclasses.field(
+        default_factory=functools.partial(collections.defaultdict, OrderedSet)
+    )
+
+    def remove(self, name: str) -> None:
+        self.reads.pop(name, None)
+        self.writes.pop(name, None)
+
+    def __bool__(self) -> bool:
+        return bool(self.reads or self.writes)
