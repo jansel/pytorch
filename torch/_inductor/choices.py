@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, Dict, List, TYPE_CHECKING
+
+import sympy
 
 from . import config
+from .codegen.triton import FixedTritonConfig
 from .runtime.hints import ReductionHint
+from .runtime.runtime_utils import next_power_of_2
 from .virtualized import V
 
 
@@ -23,6 +27,49 @@ class InductorChoices:
 
             torch._inductor.virtualized.V.set_choices_handler(MyHeuristics())
     """
+
+    def triton_kernel_kwargs(
+        self,
+        features: SIMDKernelFeatures,
+        groups: List[sympy.Expr],
+        kernel_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Hook to change the kwargs passed to TritonKernel, used to apply fixed configurations"""
+        if not (config.triton.fixed_configs and features.is_reduction()):
+            return kernel_kwargs
+
+        # need to respect existing overrides
+        cooperative = kernel_kwargs.get("override_cooperative_reduction")
+        if cooperative is None:
+            cooperative = self.should_use_cooperative_reduction(features)
+
+        persistent = kernel_kwargs.get("override_persistent_reduction")
+        if persistent is None:
+            persistent = self.should_use_persistent_reduction(features, cooperative)
+
+        cfg = {
+            "XBLOCK": 1,
+            "num_stages": 1,
+            "num_warps": 8,
+        }
+
+        if persistent:
+            cfg["RBLOCK"] = next_power_of_2(
+                V.graph.sizevars.size_hint(features.reduction_numel)
+            )
+            V.graph.sizevars.guard_leq(features.reduction_numel, cfg["RBLOCK"])
+        else:
+            cfg["RBLOCK"] = 1024
+
+        if cooperative:
+            cfg["RSPLIT"] = 64
+
+        return {
+            **kernel_kwargs,
+            "override_cooperative_reduction": cooperative,
+            "override_persistent_reduction": persistent,
+            "fixed_config": FixedTritonConfig(cfg),
+        }
 
     @staticmethod
     def should_use_cooperative_reduction(features: SIMDKernelFeatures) -> bool:

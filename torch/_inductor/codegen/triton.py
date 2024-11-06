@@ -1420,8 +1420,10 @@ class TritonKernel(SIMDKernel):
             if tree.grid_dim is not None:
                 tree.grid_dim += 1
 
-        xnumel, rnumel = self.numels
-        self.semaphores_name = self.args.semaphores(xnumel)
+        sem_count, _ = self.numels
+        if self.fixed_config:
+            sem_count = CeilDiv(sem_count, self.fixed_config["XBLOCK"])
+        self.semaphores_name = self.args.semaphores(sem_count)
         self.cooperative_reduction_workspace_cache = CooperativeReductionWorkspaceCache(
             self.args
         )
@@ -3603,7 +3605,11 @@ class TritonScheduling(SIMDScheduling):
         # so taking the hit of non-coalesced loads is okay
         if kernel_features.contains_op("sort"):
             kernel_kwargs["override_persistent_reduction"] = True
+            kernel_kwargs["override_cooperative_reduction"] = False
 
+        kernel_kwargs = V.choices.triton_kernel_kwargs(
+            kernel_features, kernel_args, kernel_kwargs
+        )
         kernel = kernel_type(*kernel_args, **kernel_kwargs)
         return self.add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs)
 
@@ -3616,6 +3622,9 @@ class TritonScheduling(SIMDScheduling):
         kernels: List[SIMDKernel] = [kernel]
         if not config.triton.multi_kernel:
             return kernels
+        assert not kernel_kwargs.get(
+            "fixed_config"
+        ), "multi_kernel conflicts with fixed_config"
 
         optional_persistent = kernel.persistent_reduction and not kernel_kwargs.get(
             "override_persistent_reduction"

@@ -994,6 +994,9 @@ class triton:
     # 3: enable, force using non-persistent reduction (for debugging)
     multi_kernel = int(os.environ.get("TORCHINDUCTOR_MULTI_KERNEL", "0"))
 
+    # avoid runtime autotuning and instead use heuristics
+    fixed_configs = False
+
     # hint to Triton when arguments are divisible by 16
     divisible_by_16 = True
 
